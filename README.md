@@ -1,1 +1,357 @@
-# Goldrush
+# GoldRush 竞赛策略仓库
+
+本文档汇总：**比赛规则** → **由规则推导出的关键结论** → **日志实证规律** → **当前策略 v1 的缺陷** → **改进路线图** → **论文阅读清单**。
+
+相关文件：
+
+- `strategy.py` — 当前 v1 策略实现
+- `LOG_FINDINGS_GOLD_BOMB.md` — 首日 16 份日志的金币/炸弹规律分析
+
+---
+
+## 一、比赛规则
+
+### 1.1 战场
+
+- 17x17 网格，两名玩家各控制 **2 个角色**，出生点在主对角线或副对角线两端。
+- 地图含 **障碍物**、**炸弹**、**NPC**。
+  - 障碍物格不可进入。
+  - 炸弹：角色进入后损失当前持有金币的 **X% = 10%**（向上取整），**炸弹随即消失**，角色可继续行动。
+  - 炸弹每 **Y = 20 轮**刷新一次。
+- 视野：全局信息不公开，每个角色默认视野为以自身为中心的 **5x5**，可花金币扩展。
+- 每 **D = 5 轮**发布一次全局区域快照。
+
+### 1.2 NPC
+
+- 开局全部出生在地图正中央，总数 **A = 7**（公测期）。
+- 每个 NPC 每轮最多移动 **B = 3 步**。
+- NPC 之间、NPC 与玩家角色之间**可重叠**。
+- NPC **参与金币争夺**，但不计入胜负判定。
+
+### 1.3 金币生成
+
+- 中心 9x9 区域**每回合**随机生成金币。
+- 9x9 区域外**每若干轮**随机生成金币。
+
+### 1.4 移动与拾取
+
+- 两个角色初始金币均为 0。
+- 每轮两个角色共分配 **S = 6 次**移动，可任意分配给两人。
+- **非法移动**（越界 / 撞障碍物 / 撞其他玩家角色）不执行，但**后续移动照常进行**（即浪费一步）。
+- 进入 NPC 数 **> 2** 的格子，因踩踏损失当前 **N% = 5%** 金币（向上取整）。
+- **执行顺序按决策耗时从小到大**。同一格的金币/炸弹由**先执行者**获取/触发。**NPC 的行动顺序位于两名玩家之间。**
+- 拾取：从其他格移入含金币的格，获得该格 **C% = 65%** 金币，**向上取整**。
+
+### 1.5 胜负
+
+- 固定 **500 轮**，结束时金币总量多者胜。
+- **金币相同时，P90 延迟更低者胜。**
+
+### 1.6 编程与时限
+
+- 语言：C++（提交 .so）或 Python（提交 .py）。
+- **每轮必须返回合法决策**，格式非法或运行时错误**直接判负**。
+- 时限：每轮标准 **300ms**，另有 **T = 60 秒**总思考时间池。单轮超出 300ms 的部分从池中扣除，**池耗尽判负**。
+
+### 1.7 接口速查
+
+```c
+struct Position { int row; int col; };
+struct NpcInfo  { int id; Position pos; };          // id 跨回合不变，空槽为 0，不可见时 (-1,-1)
+
+struct RegionStat {
+    int id;              // 区域编号 1-5
+    int enter;           // 窗口内进入该区域的角色次数
+    int leave;           // 窗口内离开该区域的角色次数
+    int gold_generated;  // 窗口内该区域生成的金币总量
+    int gold_collected;  // 窗口内该区域被拾取的金币总量
+    int gold_remaining;  // 该区域地面当前剩余金币
+    int occupants;       // 该区域当前角色数
+};
+struct Snapshot { int window_begin; int window_end; RegionStat regions[5]; };
+
+struct GameInput {
+    int round;                    // 从 0 开始
+    int grid[17][17];             // -5 迷雾 / -3 炸弹 / -1 障碍 / 0 空地 / >=1 金币数量
+    Position my_units[2];
+    int my_units_gold[2];         // 两角色各自持有金币
+    int gold_opp;                 // 对手两角色金币总和
+    Position visible_enemies[2];
+    int num_visible_npcs;
+    NpcInfo visible_npcs[A];
+    int snapshot_valid;           // 1=本轮有新快照
+    Snapshot snapshot;
+};
+
+struct GameOutput {
+    int actions[S];  // [0,4]  0=上 1=下 2=左 3=右 4=不动
+    int k;           // [0,S]  角色0走 actions[0:k]，角色1走 actions[k:S]
+    int order;       // {0,1}  0=角色0先执行
+    int vp;          // {0,1,2} 0=不买 / 1=买7x7(2金币) / 2=买9x9(3金币)，费用对局结束后结算
+};
+```
+
+注：**NPC 不在 grid 中标记**，只通过 `visible_npcs` 提供；视野外统一为 `-5`。
+
+---
+
+## 二、由规则推导出的关键结论
+
+这一节是规则的直接数学推论，是制定策略的地基。
+
+### 2.1 拾取取整规则决定了"广度优先"
+
+拾取为 `ceil(0.65 × G)`：
+
+| 格上金币 G | 拿走 | 剩余 |
+|---:|---:|---:|
+| 1 | 1 | 0 |
+| 2 | 2 | 0 |
+| 3 | 2 | 1 |
+| 5 | 4 | 1 |
+| 20 | 13 | 7 |
+
+**结论：1–2 金币的小堆一步即可 100% 拿走。**
+
+推论 A：**"挤奶"（踩上-退开-再踩）在 G < 3 时收益为零**，2 步换 `ceil(0.65×0.35×G)`，在 G ≲ 20 之前都不如把这 2 步用在新格子上。需要检查 v1 的 beam search 是否过度挤奶。
+
+推论 B：中心区应当按**覆盖问题**而非**追大堆问题**来解（见 2.2）。
+
+### 2.2 中心区的理论上限与最优巡逻周期
+
+由日志：区域 1 生成率 0.1668 金币/可通行格/轮，每 5 轮共 44.75 → **8.95 金币/轮**，反推中心可通行格约 **54 格**。
+
+- 6 步/轮走完 54 格 ≈ 9 轮（纯移动），计入绕障约 **12 轮/圈**。
+- 12 轮后每格积累 `0.1668 × 12 ≈ 2.0` 金币 → `ceil(0.65×2) = 2`，**恰好整堆拿走**。
+
+**即：一个纪律严明的 ~12 轮中心巡逻圈，可以把中心区产出几乎 100% 收走。** 这与 v1 的行为直接冲突——v1 是被势场牵引的 6 步贪心 beam search，重访间隔方差极大，有些格 3 轮踩一次（只拿 0.5 金币），有些 40 轮才回去（早被 NPC 拿走）。
+
+### 2.3 全场金币上限与 NPC 的支配性
+
+| 区域 | 金币/5轮 | 金币/轮 |
+|---|---:|---:|
+| 1（中心 9x9） | 44.75 | **8.95** |
+| 2–5（外围合计） | 48.73 | 9.75 |
+| **全场合计** | **93.48** | **18.70** |
+
+500 轮全场总产出 ≈ **9350 金币**。
+
+但注意移动量对比：
+
+| 方 | 每轮步数 | 占比 |
+|---|---:|---:|
+| NPC（7 个 × 3 步） | 21 | **64%** |
+| 我方（2 角色共享） | 6 | 18% |
+| 对手 | 6 | 18% |
+
+**NPC 的总移动量是我方的 3.5 倍。** 无法在覆盖率上赢过 NPC，只能在**目标选择**（去价值密度最高处）和**执行顺序**（比 NPC 先到）上赢。且 NPC 全部出生于中心——中心是 NPC 密度最高的区域。
+
+**这条大幅提升了外围突袭的相对价值**（见 5.5），也意味着中心区实际可得远低于 8.95/轮。
+
+### 2.4 执行顺序：比 NPC 先动是核心杠杆
+
+顺序为 `快的玩家 → NPC → 慢的玩家`。决策快 = 在 7 个 NPC 之前拿走同一格的金币。v1 注释中实测"强制先手价值 +40%~+100% 金币"，与此机制吻合，该判断应当保留。
+
+### 2.5 时间池的 P90 漏洞（可利用）
+
+- 可持续预算：`300ms + 60s/500轮 = 420ms/轮`。
+- 但胜负平局判定看 **P90 延迟**，即第 450 慢的那一轮。
+
+**因此：可以有 10% 的回合任意慢，而 P90 完全不受影响。** 保守取 8%（40 轮），每轮可用 `60s/40 = 1.5s`（300ms 标准 + 1.2s 扣池），总扣池 48s < 60s，安全。
+
+代价是这 40 轮会后手。所以应当**只在"后手不吃亏"的回合下重注**——即 `visible_enemies` 全不可见、且身边没有被争夺的大堆时。此时深搜免费。
+
+### 2.6 炸弹损失是百分比 → 越早挨炸越便宜，且应当把金币集中
+
+- 损失 = `ceil(0.10 × 该角色当前持有金币)`。开局持有 0 时，**踩炸弹完全免费**。
+- 炸弹触发后**消失**，即角色可以主动扫雷。
+
+**推论 A（时序）：前 ~25 轮应当彻底无视炸弹**，用零成本的鲁莽换取地图信息，这些信息在剩下 475 轮里持续变现。
+
+**推论 B（分工）：金币是按角色分开记录的（`my_units_gold[2]`），而胜负看总和。** 所以最优是让**一个角色刻意保持贫穷**，专职探路/扫雷/闯高风险区（挨炸几乎不损失），另一个角色富有并且只走已清干净的安全格。总损失 = `Σ 0.1 × 挨炸时的持有量`，把持有量集中到挨炸次数最少的角色上即可最小化。这是规则里一个明确但不显然的可利用点。
+
+### 2.7 快照里有 4 个字段 v1 完全没读
+
+`RegionStat` 提供 `enter` / `leave` / `occupants` / `gold_collected`，v1 只用了 `gold_remaining`。
+
+- **`occupants` = 该区域当前角色数。** 每 5 轮免费获得对手 2 个角色的区域级位置分布——**无需视野的对手追踪**。
+- **`gold_collected` 减去我方已知拾取量 = 对手+NPC 在该区域的拾取量**，可用于估计对手活动强度与 NPC 分布。
+- 恒等式 `gold_remaining[t] = gold_remaining[t-1] + gold_generated - gold_collected` 可用来校验并反推不可见量。
+
+---
+
+## 三、日志实证规律（摘要）
+
+完整分析见 `LOG_FINDINGS_GOLD_BOMB.md`。要点：
+
+- **区域划分**：区域 1 = 中心 9x9 `[4,4]–[12,12]`；区域 2–5 为风车状外围带。
+- **中心稳定、外围爆发**：中心 99.9% 的 5 轮窗口都有产出；外围约 65% 窗口不产，11–12% 窗口大产（>20），**大产窗口贡献了外围 ~82% 的金币**，单次常见 80–112 金币。
+- **外围热点**：地图模板值 `2` 的格子，每个外围区固定 5 个，被看见时有金币的概率 **19.5%**，而普通外围空地仅 **1.65%**（约 12 倍），平均金币量约 27.6 倍。**但初赛换图，坐标必须在线学习，不可硬编码。**
+- **炸弹 20 轮整体重采样**：周期内不新增炸弹；跨 `round%20: 19→0` 后旧位置保留率仅 8.4%，相邻周期 Jaccard 重合度约 2.5%。
+- **炸弹密度**：中心 3.00%，外围 5.35–6.35%；周期内从刷新时 6.39% 衰减到 `%20==15` 时 4.77%。
+
+---
+
+## 四、当前策略 v1 的缺陷清单
+
+| # | 缺陷 | 位置 | 性质 |
+|---|---|---|---|
+| 1 | 炸弹记忆不随 20 轮周期清空，只在重新看见时才更新 | `_observe` | **Bug** |
+| 2 | 格子一旦被看过 `risk[i]` 永久置 0，迷雾格不计炸弹风险 | `_observe` / `_estimate` | **Bug** |
+| 3 | `OUTER_REGEN = 0.05` 均匀，无法体现 12 倍热点 | CONFIG | 建模缺失 |
+| 4 | 快照 `gold_remaining` 被均摊到整个区域，80 金币爆发被稀释成每格 +0.6 | `_estimate` | 建模缺失 |
+| 5 | `enter`/`leave`/`occupants`/`gold_collected` 完全未使用 | — | 信息浪费 |
+| 6 | `POT_W` 到最后一轮仍为 0.35，终局仍在"走向"远处金币 | `_plan` | 建模缺失 |
+| 7 | 风险厌恶不随持有金币/回合数变化，开局免费的鲁莽没有利用 | CONFIG | 建模缺失 |
+| 8 | 只用 300ms 预算的 0.3%（~0.9ms），时间池 60s 完全未动 | 全局 | 资源浪费 |
+| 9 | 规划视野恰好 1 轮（6 步），产生不了巡逻行为 | `_plan` | 结构限制 |
+| 10 | 两角色对称，未利用"贫穷角色挨炸免费"的分工 | `_decide` | 策略缺失 |
+| 11 | 视野购买用收入 EMA 拍脑袋，非信息价值（VOI）驱动 | `_vision` | 建模缺失 |
+| 12 | `COMP_DISCOUNT` 被关掉（=1.0），但 NPC 占 64% 移动量，竞争是真实的 | CONFIG | 待重推 |
+
+---
+
+## 五、改进路线图（按 ROI 排序）
+
+### 第一梯队：便宜且必做
+
+**5.1 炸弹记忆按 20 轮周期清空**（缺陷 1）
+日志显示跨周期重合度仅 2.5%，即每次跨越 `round%20==0` 后，几乎**所有**记忆中的炸弹都是错的。v1 既在绕开幻影炸弹，更糟的是把上周期"排查干净"的格子当成安全格，而那里现在可能有雷。
+*改动*：`round % 20 == 0` 时清空 `bomb[]`。约 3 行。
+
+**5.2 迷雾格必须计炸弹风险**（缺陷 2）
+`risk[i]` 首次观测后永久归零，30 轮前看过的格子被当作确定无雷。实际常驻雷率中心 3.0%、外围 5.3–6.4%，且随周期相位变化。
+*改动*：对非本轮可见格，`risk[i] = P_bomb(区域, 周期相位) × 0.10 × 该角色持有金币`。注意这使风险**依赖角色且随金币缩放**。
+*收益*：终局尤其大——持有 200 金币时每步迷雾的隐含成本是 `0.05 × 0.10 × 200 = 1.0` 金币，与一整格的拾取量相当，目前完全未计价。
+
+**5.3 阶段化风险：开局免费鲁莽 + 终局势场归零**（缺陷 6、7）
+- 前 ~25 轮：`FOG_STEP → 0`，彻底无视炸弹，做一次高强度地图测绘冲刺（依据 2.6）。
+- 最后 ~15 轮：`POT_W_eff = POT_W × min(1, 剩余轮数/15)`，同时抬高风险厌恶。
+*改动*：约 15 行，纯收益。
+
+**5.4 读取快照的另外 4 个字段**（缺陷 5）
+按 2.7 实现对手区域级追踪与竞争强度估计。这是**已经免费送到手里、但被丢弃**的信息。
+
+### 第二梯队：两个战略级增益
+
+**5.5 快照驱动的外围突袭模式**（缺陷 4）
+外围占全场 52% 的产出，其中 82% 来自爆发窗口（单次 80–112 金币）。而 NPC 主要盘踞中心（2.3），外围爆发的金币会**站在地上等人来拿**。
+*改动*：把快照当作**模式切换信号**而非先验微调。当某外围区 `gold_remaining` 越过阈值时派遣角色突袭。
+*账要算清*：中心→外围往返约 12–16 步 ≈ 2–3 个角色轮，代价约 10–13 金币的中心机会成本，博 80 金币的奖励——**6–8 倍回报**。
+*这大概率是单项最大的提升。*
+
+**5.6 外围热点在线学习**（缺陷 3）
+每格维护一个"金币到达率"的 Beta/Gamma 后验，每次观测更新，缓慢衰减。这正是阅读清单 A 类（带学习的 Whittle 指标）的标准设定。然后把 5.5 的快照重标定**按后验权重分配**而非均摊——突袭因此从"在区域里乱逛"变成"直扑 5 个已知点"。
+*与 5.5 相乘增益。*
+
+**5.7 中心区改为分区巡逻**（缺陷 9）
+依据 2.2，中心是覆盖问题。多机器人巡逻文献的结论是：**智能体少、区域紧凑时，分区（partition）优于共享环路（cyclic）**——即给每个角色分配中心 9x9 的一半，各自跑自己的紧凑巡逻圈，大堆出现时允许贪心偏离。实现便宜，容易 A/B。
+
+**5.8 贫富分工**（缺陷 10）
+依据 2.6 推论 B：指定角色 0 为探路/扫雷位，刻意走低金币区域保持贫穷；角色 1 为收割位，只走已清空的中心安全格。需要实测验证收益是否被"贫穷角色产出低"抵消。
+
+### 第三梯队：时间优化
+
+**5.9 用 P90 漏洞做非对称时间分配**（缺陷 8）
+不要改成"每轮都慢"——先手价值 +40~100% 的结论是对的，且 P90 还是平局判据。正确做法是 2.5 的非对称方案：
+
+- **92% 的回合保持 ~1ms**（先手、低 P90）。
+- **8% 的回合（约 40 轮）用到 1.5s 深搜**，触发条件为 `visible_enemies` 全不可见 **且** 附近无争夺中的大堆——此时后手不吃亏，深搜是净赚。
+- 硬性护栏：总扣池上限设 50s（留 10s 余量），且搜索必须是 **anytime** 的，随时可截断并返回合法决策；保留现有的 all-stay 兜底。
+
+**5.10 深搜回合上跑 anytime 规划器**
+一旦 5.9 释放出 1.5s，beam search 的形状就不对了：
+
+- **RHEA**（阅读清单 E）：直接演化 `actions[6] + k + order` 这个输出向量，天然 anytime，且把 `k` 和 `order` 作为基因组的一部分，而不是外层 7×2 的枚举循环。**最容易移植。**
+- **DESPOT**（阅读清单 D）：如果要对迷雾和炸弹做真正的信念空间规划，而非对点估计做规划。
+
+同时把规划视野从 6 步（1 轮）延长到 12 步（2 轮）——巡逻行为会自己涌现。
+
+**5.11 常规回合的微优化**
+`_estimate` 与 `_potential` 每轮都做 289 格全量扫描 + 一次 Dijkstra；`DIST` 是 289×289 表，`self.gp` 又复制了一份浮点版。若 5.9 的快速回合预算吃紧，改用 `array('d')`，并在信念几乎没变的回合跳过 `_potential` 重算。
+
+### 第四梯队：基础设施（应尽早做，否则上面全部无法度量）
+
+**5.12 配对自对弈评测台**
+v1 注释承认调参时延迟是混杂因素，这让所有已报告的数字都存疑。建议：N ≥ 200 局，配对随机种子，交换出生角，**强制固定执行顺序**以隔离决策质量；再跑一遍带真实延迟的，单独给顺序效应定价。
+**核心 KPI：金币/轮，对标 2.3 的 18.70 上限**，带置信区间。目前没人知道 v1 是发挥了上限的 40% 还是 80%，这让每个调参决定都是盲的。
+
+**5.13 用 CMA-ES 替代手工调参**
+CONFIG 块有 ~15 个可调项，逐个手扫会陷入局部最优且漏掉交互（`GAMMA` × `POT_W` 强耦合）。有了 5.12 的低噪声适应度信号后，CMA-ES 或 SMAC 是一个周末的工作量。
+
+---
+
+## 六、论文阅读清单
+
+### A. 核心结构：离开后会重新生长的奖励 —— 最匹配的一类文献
+
+格子被访问后归零、无人时线性累积，这**正是"带重置过程的 restless bandit"**，且有闭式指标解。
+
+- Liu, Weber & Zhao (2011), *Indexability and Whittle Index for Restless Bandit Problems Involving Reset Processes* — [PDF](http://www.statslab.cam.ac.uk/~rrw1/publications/Liu%20-%20Weber%20-%20Zhao%202011%20Indexability%20and%20Whittle%20Index%20for%20restless%20bandit%20problems%20involving%20reset%20processes.pdf)。**优先读这篇**，动态与本赛题完全对应。
+- Avrachenkov & Borkar, *Whittle index based Q-learning for restless bandits with average reward* — [arXiv:2004.14427](https://arxiv.org/pdf/2004.14427)。生成率未知（外围区）时在线学习指标。
+- Nakhleh et al., *NeurWIN: Neural Whittle Index Network* — [NeurIPS 2021](https://proceedings.neurips.cc/paper/2021/file/0768281a05da9f27df178b5c39a51263-Paper.pdf)。仅在走学习策略路线时需要。
+
+**可直接借用的思想**：把 `est[] + 势场` 换成每格一个指标 `λ(i) = f(生成率_i, 距上次访问轮数_i)`，再规划"每步指标收益最大"的路线。指标是**标量优先级**，比"最大值折扣势场"更容易和路径规划器组合，且会自然涌现巡逻行为，无需硬编码环路。
+
+### B. 移动预算下的路径规划（每轮 6 步的子问题）
+
+"从当前位置出发、长度 ≤6 的游走、最大化收集奖励"= 2 车辆的 Team Orienteering Problem。
+
+- Chao, Golden & Wasil (1996), *The team orienteering problem* — [EJOR](https://www.sciencedirect.com/science/article/abs/pii/0377221794002894)
+- Vansteenwegen et al. (2011), *The orienteering problem: A survey* — [EJOR](https://www.sciencedirect.com/science/article/abs/pii/S0377221710002973)
+- 2025 综述，模型演进与算法进展 — [arXiv:2512.16865](https://arxiv.org/pdf/2512.16865)
+- Hammami, Rekik & Coelho, *Hybrid ALNS for the TOP* — [C&OR 2020](https://www.sciencedirect.com/science/article/abs/pii/S0305054820301519)。ALNS 的破坏/修复结构很适合 anytime 预算。
+
+**要点**：6 步预算小到几乎可以精确求解，难点不在路线而在**奖励估计**（即 A 类）。
+
+### C. 持续监测 / 巡逻（对应 5.7 中心巡逻）
+
+- Cassandras, Lin & Ding, *Optimal control for multi-agent persistent monitoring* — [Automatica 2013](https://www.sciencedirect.com/science/article/abs/pii/S0005109814001411)
+- *A sub-modular receding horizon solution for mobile multi-agent persistent monitoring* — [arXiv:1908.04425](https://arxiv.org/pdf/1908.04425)。最接近可直接实现的形态：滚动视界 + 次模贪心 + 有界时间。
+- *ε-Optimal Multi-Agent Patrol using Recurrent Strategy* — [arXiv:2509.11640](https://arxiv.org/pdf/2509.11640)
+- Portugal & Rocha, *A Survey on Multi-robot Patrolling Algorithms* — [链接](https://www.researchgate.net/publication/220832895_A_Survey_on_Multi-robot_Patrolling_Algorithms)。环路 vs 分区策略的对比，直接对应两角色如何分工。
+
+### D. 部分可观测下的规划
+
+- Silver & Veness (2010), *Monte-Carlo Planning in Large POMDPs*（POMCP） — [NeurIPS PDF](https://papers.neurips.cc/paper_files/paper/2010/file/edfbe1afcf9246bb0d40eb4d8027d90f-Paper.pdf)
+- Ye, Somani, Hsu & Lee, *DESPOT: Online POMDP Planning with Regularization* — [arXiv:1609.03250](https://arxiv.org/pdf/1609.03250)。在**固定实时预算**下优于 POMCP，且带正则化以防对采样场景过拟合——当你对迷雾格的信念主要来自先验时，这一点很关键。
+
+### E. 实时预算内的博弈搜索（对应 5.10）
+
+- Gaina, Lucas & Perez-Liebana, *Rolling Horizon Evolutionary Algorithms for General Video Game Playing* — [arXiv:2003.12331](https://arxiv.org/pdf/2003.12331) / [ToG'21 PDF](http://www.diego-perez.net/papers/RHEAforGVGP_ToG21.pdf)。**清单中最容易直接移植的算法**：演化的就是动作序列，正好是本赛题的输出格式。
+- Perez-Liebana et al., *Rolling Horizon NEAT* — [arXiv:2005.06764](https://arxiv.org/pdf/2005.06764)
+
+### F. 最接近的公开赛题：Pommerman
+
+部分可观测网格、炸弹、双角色队伍、实时预算。NeurIPS 2018 前排是 **MCTS 而非深度 RL** —— 这对精力投向是个有用的先验。
+
+- *Developing a Successful Bomberman Agent* — [arXiv:2203.09608](https://arxiv.org/pdf/2203.09608)
+- Gao et al., *Skynet: A Top Deep RL Agent in the Inaugural Pommerman Team Competition* — [链接](https://www.researchgate.net/publication/332897569_Skynet_A_Top_Deep_RL_Agent_in_the_Inaugural_Pommerman_Team_Competition)
+- *Know your Enemy: Investigating MCTS with Opponent Models in Pommerman* — [arXiv:2305.13206](https://arxiv.org/pdf/2305.13206)
+- [MultiAgentLearning/playground](https://github.com/MultiAgentLearning/playground) — 参考环境
+
+### G. 该往哪看：探索与视野购买（对应缺陷 11）
+
+- Singh, Krause, Guestrin, Kaiser & Batalin, *Nonmyopic Adaptive Informative Path Planning for Multiple Robots* — [IJCAI'09](https://www.ijcai.org/Proceedings/09/Papers/306.pdf)。多机器人次模定向问题，正是本赛题的双角色探索问题。
+- Krause & Golovin, *Submodular Function Maximization* 综述 — [PDF](https://viterbi-web.usc.edu/~shanghua/teaching/Fall2023-670/krause12survey.pdf)。提供 `(1-1/e)` 贪心保证，从而可以只用一个廉价的贪心信息增益项，不必上复杂方法。
+- *Informative Path Planning with Limited Adaptivity* — [arXiv:2311.12698](https://arxiv.org/pdf/2311.12698)
+
+---
+
+## 七、下一步待办
+
+### 应立即从日志中补做的分析
+
+1. **各区域 `gold_collected / gold_generated` 比值。** 若中心接近 100%、外围仅约 30%，说明外围有站着不动的存量金币，5.5 的突袭价值还要再上调。这是当前最该跑的一个分析。
+2. **NPC 移动模型**：是随机游走还是趋向金币？决定 `COMP_DISCOUNT`（缺陷 12）如何重推。
+3. **v1 实测金币/轮**，对标 2.3 的 18.70 上限。没有这个数，路线图里所有优先级都只是推测。
+4. **检查 beam search 是否过度挤奶**（依据 2.1 推论 A）。
+
+### 需要向主办方或通过实测确认的规则细节
+
+1. 拾取到底是 `ceil` 还是 `floor`？v1 假设 `ceil`。**2.1 和 2.2 的全部论证依赖于此**，是本文档中杠杆最大的单个事实，务必优先验证。
+2. `occupants` 统计的是玩家角色还是包含 NPC？决定 2.7 的对手追踪是否成立。
+3. 炸弹刷新边界是否严格为 `round % 20 == 0`？第 0 轮开局是否已布雷？
+4. 撞到**己方另一个角色**是否算非法移动？v1 两者都当作阻挡。
+5. NPC 拾取是否同样按 65% 向上取整？
+6. `vp` 购买的视野在**当轮**即生效，还是下一轮生效？
