@@ -46,6 +46,7 @@ instance, e.g. Player(BEAM_WIDTH=24), which is what the offline sweeps used.
 """
 
 import heapq
+import math
 
 # ----------------------------------------------------------------------------
 # Game constants (mirror the rulebook)
@@ -104,14 +105,18 @@ VIS_WARMUP = 30        # no vision purchases before this round
 VIS_EMA = 0.05         # income EMA smoothing
 BLIND_BONUS = 10.0     # income level above which we buy 7x7 when we see nothing
 
-# Region ids 1..5 used by the snapshot. The rulebook does not pin the layout
-# down, so this is the natural guess: 5 = center 9x9, 1..4 = the four outer
-# quadrants (TL, TR, BL, BR). Snapshot influence is clamped, so a wrong guess
-# degrades gracefully — fix REGION_OF once you see real snapshot data.
+# Region ids 1..5 used by the snapshot: 1 is the center 9x9, and 2..5
+# are the windmill-shaped outer bands published in the FAQ.
 def _region_of(r, c):
     if CENTER_LO <= r <= CENTER_HI and CENTER_LO <= c <= CENTER_HI:
-        return 5
-    return 1 + (0 if r < 8 else 2) + (0 if c < 8 else 1)
+        return 1
+    if r <= 3 and c <= 12:
+        return 2
+    if r >= 4 and c <= 3:
+        return 3
+    if r >= 13 and c >= 4:
+        return 4
+    return 5
 
 
 REGION_OF = [_region_of(i // N, i % N) for i in range(N * N)]
@@ -262,17 +267,20 @@ class Player:
             score = lead[0] + tail[0]
             if best is None or score > best[0]:
                 acts = [None, None]
+                finals = [None, None]
                 acts[first] = lead[2]
                 acts[second] = tail[2]
-                best = (score, order, acts)
+                finals[first] = lead[4]
+                finals[second] = tail[4]
+                best = (score, order, acts, finals)
 
-        _, order, acts = best
+        _, order, acts, finals = best
         a0 = list(acts[0])[:best_k]
         a1 = list(acts[1])[:S - best_k]
         a0 += [STAY] * (best_k - len(a0))
         a1 += [STAY] * (S - best_k - len(a1))
 
-        vp = self._vision(rnd, golds, idx)
+        vp = self._vision(rnd, golds, finals)
         return a0 + a1 + [best_k, order, vp]
 
     # -------------------------------------------------------- observation --
@@ -283,12 +291,23 @@ class Player:
         for i, npc in enumerate(lst):
             if i >= n:
                 break
-            if isinstance(npc, (tuple, list, dict)) and not isinstance(npc, dict):
-                r, c = _pos(npc)
+            if isinstance(npc, (tuple, list)):
+                if len(npc) >= 3:
+                    if int(npc[0] or 0) == 0:
+                        continue
+                    r, c = int(npc[1]), int(npc[2])
+                else:
+                    r, c = _pos(npc)
             else:
                 if int(_f(npc, "id", 0) or 0) == 0:
                     continue
-                r, c = _pos(_f(npc, "pos"))
+                p = _f(npc, "pos")
+                if p is None:
+                    p = _f(npc, "position")
+                if p is not None:
+                    r, c = _pos(p)
+                else:
+                    r, c = int(_f(npc, "row", -1)), int(_f(npc, "col", -1))
             if 0 <= r < N and 0 <= c < N:
                 out.append(r * N + c)
         return out
@@ -492,8 +511,7 @@ class Player:
             cand = {}
             for _, _, val, pos, harv, sig, hit, acts in beam:
                 held = unit_gold + val
-                bomb_pen = BOMB_PCT * held
-                tramp_pen = TRAMPLE_PCT * held
+                bomb_pen = math.ceil(BOMB_PCT * held) if held > 0.0 else 0
                 for a, nxt in NEIGH[pos]:
                     if obstacle[nxt] or nxt in blocked:
                         continue      # an illegal move is a burned move
@@ -505,7 +523,7 @@ class Player:
                         taken = 0.0
                         avail = est[nxt]
                     if avail > 0.0:
-                        gain = PICK_RATE * avail
+                        gain = math.ceil(PICK_RATE * avail)
                         nharv = dict(harv)
                         nharv[nxt] = taken + gain
                         nsig = sig | bit
@@ -517,6 +535,9 @@ class Player:
                         gain -= bomb_pen
                         nhit = hit | bit
                     if npc_cnt.get(nxt, 0) >= TRAMPLE_NPC:
+                        after_pickup = held + gain
+                        tramp_pen = (math.ceil(TRAMPLE_PCT * after_pickup)
+                                     if after_pickup > 0.0 else 0)
                         gain -= tramp_pen
                     gain -= risk[nxt]
                     nval = val + gain
