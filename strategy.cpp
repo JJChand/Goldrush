@@ -16,10 +16,10 @@ namespace {
 
 constexpr int N = 17;
 constexpr int NN = N * N;
-constexpr int S = 6;
+constexpr int STEPS = 6;
 constexpr int API_NPC_SLOTS = static_cast<int>(
     sizeof(((GameInput*)nullptr)->visible_npcs) / sizeof(NpcInfo));
-constexpr int MAX_NPCS = 16;
+constexpr int NPC_CAP = 16;
 constexpr int MASK_WORDS = 5;
 constexpr int MAX_HARVEST = 12;
 constexpr int MAX_BEAM_WIDTH = 8;
@@ -243,7 +243,7 @@ struct Pending {
 GameOutput stay_output() noexcept {
     GameOutput out{};
     for (int& action : out.actions) action = STAY;
-    out.k = S / 2;
+    out.k = STEPS / 2;
     out.order = 0;
     out.vp = 0;
     return out;
@@ -318,9 +318,9 @@ private:
     void plan(int start, int unit_gold, int budget, const Mask289& blocked,
               const int npc_count[NN], float pot_weight, int unit_id,
               const HarvestState* pre_harvest, const Mask289& initial_cleared,
-              int beam_width, PlanResult result[S + 1]) noexcept;
+              int beam_width, PlanResult result[STEPS + 1]) noexcept;
     JointResult joint_score(const int starts[2], const int gold[2],
-                            const int actions[2][S], const int length[2], int order,
+                            const int actions[2][STEPS], const int length[2], int order,
                             const Mask289& enemy_mask,
                             const int npc_count[NN], float pot_weight) noexcept;
     int vision(int round, const int gold[2], const int final_cell[2],
@@ -736,7 +736,7 @@ void Strategy::classify_roles(int round, const int gold[2], const int position[2
             int fog[2]{};
             for (int unit = 0; unit < 2; ++unit)
                 for (int cell = 0; cell < NN; ++cell)
-                    if (dist_[position[unit]][cell] <= S && !terrain_known_[cell])
+                    if (dist_[position[unit]][cell] <= STEPS && !terrain_known_[cell])
                         ++fog[unit];
             scout = fog[0] >= fog[1] ? 0 : 1;
         }
@@ -766,14 +766,14 @@ void Strategy::classify_roles(int round, const int gold[2], const int position[2
     const int loss_gap = collector_loss - scout_loss;
     if (info_strength > 0.0F || (loss_gap > 0 && clear_strength > 0.0F)) {
         for (int cell = 0; cell < NN; ++cell) {
-            if (dist_[position[scout]][cell] > S || obstacle_[cell]) continue;
+            if (dist_[position[scout]][cell] > STEPS || obstacle_[cell]) continue;
             float bonus = !terrain_known_[cell] ?
                 SCOUT_INFO_BONUS * info_strength : 0.0F;
             if (loss_gap > 0 && bomb_safe_round_[cell] < cycle_start) {
                 const float probability = bomb_[cell] ? 1.0F :
                     turn_risk_rate_[region_[cell]];
                 if (probability > 0.0F) {
-                    const float relevance = dist_[position[collector]][cell] <= S ?
+                    const float relevance = dist_[position[collector]][cell] <= STEPS ?
                         1.0F : 0.25F;
                     const float target_weight = std::min(1.0F, 0.25F + pot_[cell] / 6.0F);
                     bonus += SCOUT_CLEAR_SHARE * clear_strength * loss_gap *
@@ -791,11 +791,24 @@ void Strategy::classify_roles(int round, const int gold[2], const int position[2
         const int enemy = enemies[e];
         for (int action = 0; action < 4; ++action) {
             const int cell = next_cell(enemy, action);
-            if (cell < 0 || obstacle_[cell] || dist_[position[scout]][cell] > S) continue;
+            if (cell < 0 || obstacle_[cell] || dist_[position[scout]][cell] > STEPS) continue;
             target[count++] = Target{pot_[cell] + est_[cell], cell};
         }
-        std::sort(target, target + count,
-                  [](const Target& a, const Target& b) { return a.value > b.value; });
+        // Descending insertion sort. `count` is provably <= 4 (one candidate per
+        // direction), but GCC >= 12 cannot see that through an inlined std::sort:
+        // __final_insertion_sort contains a `__first + 16` branch that is dead
+        // here, yet still trips -Warray-bounds against target[4]. The warning is
+        // a false positive, but a hand-rolled sort is both warning-free and
+        // cheaper than std::sort for n <= 4, so this is a strict improvement.
+        for (int i = 1; i < count; ++i) {
+            const Target key = target[i];
+            int j = i - 1;
+            while (j >= 0 && target[j].value < key.value) {
+                target[j + 1] = target[j];
+                --j;
+            }
+            target[j + 1] = key;
+        }
         for (int rank = 0; rank < std::min(2, count); ++rank) {
             if (target[rank].value <= 0.0F) continue;
             float bonus = std::min(DENIAL_CAP, DENIAL_WEIGHT * target[rank].value);
@@ -809,7 +822,7 @@ void Strategy::plan(int start, int unit_gold, int budget, const Mask289& blocked
                     const int npc_count[NN], float pot_weight, int unit_id,
                     const HarvestState* pre_harvest,
                     const Mask289& initial_cleared, int beam_width,
-                    PlanResult result[S + 1]) noexcept {
+                    PlanResult result[STEPS + 1]) noexcept {
     const bool is_scout = unit_id == turn_scout_;
     HarvestState initial_harvest{};
     if (pre_harvest) initial_harvest = *pre_harvest;
@@ -970,7 +983,7 @@ void Strategy::plan(int start, int unit_gold, int budget, const Mask289& blocked
 }
 
 JointResult Strategy::joint_score(const int starts[2], const int gold[2],
-                                  const int actions[2][S], const int length[2],
+                                  const int actions[2][STEPS], const int length[2],
                                   int order, const Mask289& enemy_mask,
                                   const int npc_count[NN],
                                   float pot_weight) noexcept {
@@ -1121,9 +1134,9 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
     };
     confirm_pending(round, position);
 
-    int npcs[MAX_NPCS]{};
+    int npcs[NPC_CAP]{};
     int npc_total = 0;
-    const int reported_npcs = std::min({MAX_NPCS, API_NPC_SLOTS,
+    const int reported_npcs = std::min({NPC_CAP, API_NPC_SLOTS,
                                         std::max(0, input.num_visible_npcs)});
     for (int i = 0; i < reported_npcs; ++i) {
         if (input.visible_npcs[i].id != 0 && valid_position(input.visible_npcs[i].pos))
@@ -1160,36 +1173,36 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
     classify_roles(round, gold, position, enemies, enemy_total);
 
     const Mask289 empty_mask{};
-    PlanResult curve[2][S + 1];
-    plan(position[0], gold[0], S, enemy_mask, npc_count, pot_weight, 0,
+    PlanResult curve[2][STEPS + 1];
+    plan(position[0], gold[0], STEPS, enemy_mask, npc_count, pot_weight, 0,
          nullptr, empty_mask, BEAM_WIDTH, curve[0]);
-    plan(position[1], gold[1], S, enemy_mask, npc_count, pot_weight, 1,
+    plan(position[1], gold[1], STEPS, enemy_mask, npc_count, pot_weight, 1,
          nullptr, empty_mask, BEAM_WIDTH, curve[1]);
 
-    int path[2][S + 1][S]{};
-    for (int depth = 0; depth <= S; ++depth) {
+    int path[2][STEPS + 1][STEPS]{};
+    for (int depth = 0; depth <= STEPS; ++depth) {
         for (int unit = 0; unit < 2; ++unit) {
-            for (int step = 0; step < S; ++step) path[unit][depth][step] = STAY;
+            for (int step = 0; step < STEPS; ++step) path[unit][depth][step] = STAY;
             decode_actions(curve[unit][depth].code, depth, path[unit][depth]);
         }
     }
 
     float best_score = -std::numeric_limits<float>::infinity();
-    int best_k = S / 2;
+    int best_k = STEPS / 2;
     int best_order = 0;
-    int best_actions[2][S]{};
+    int best_actions[2][STEPS]{};
     int best_length[2]{};
     JointResult best_result{};
 
-    for (int k = 0; k <= S; ++k) {
-        int actions[2][S]{};
-        int length[2] = {k, S - k};
+    for (int k = 0; k <= STEPS; ++k) {
+        int actions[2][STEPS]{};
+        int length[2] = {k, STEPS - k};
         for (int step = 0; step < k; ++step) actions[0][step] = path[0][k][step];
-        for (int step = 0; step < S - k; ++step)
-            actions[1][step] = path[1][S - k][step];
-        const bool order_matters = curve[0][k].cleared.intersects(curve[1][S - k].cleared) ||
+        for (int step = 0; step < STEPS - k; ++step)
+            actions[1][step] = path[1][STEPS - k][step];
+        const bool order_matters = curve[0][k].cleared.intersects(curve[1][STEPS - k].cleared) ||
             curve[0][k].cleared.test(position[1]) ||
-            curve[1][S - k].cleared.test(position[0]);
+            curve[1][STEPS - k].cleared.test(position[0]);
         const int order_count = order_matters ? 2 : 1;
         for (int order = 0; order < order_count; ++order) {
             const JointResult result = joint_score(position, gold, actions, length,
@@ -1208,26 +1221,26 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
     }
 
     bool interaction = curve[0][best_k].harvest.mask.intersects(
-                           curve[1][S - best_k].harvest.mask) ||
+                           curve[1][STEPS - best_k].harvest.mask) ||
                        best_result.position[0] != curve[0][best_k].final_cell ||
-                       best_result.position[1] != curve[1][S - best_k].final_cell;
+                       best_result.position[1] != curve[1][STEPS - best_k].final_cell;
     if (interaction) {
         const int first = best_order;
         const int second = 1 - best_order;
         int candidate_k[2] = {best_k,
             best_k + (second == 0 ? 1 : -1)};
-        const int candidate_count = candidate_k[1] >= 0 && candidate_k[1] <= S ? 2 : 1;
+        const int candidate_count = candidate_k[1] >= 0 && candidate_k[1] <= STEPS ? 2 : 1;
         for (int candidate = 0; candidate < candidate_count; ++candidate) {
             const int coordinated_k = candidate_k[candidate];
-            int budget[2] = {coordinated_k, S - coordinated_k};
+            int budget[2] = {coordinated_k, STEPS - coordinated_k};
             if (budget[second] <= 0) continue;
-            int coordinated[2][S]{};
+            int coordinated[2][STEPS]{};
             for (int step = 0; step < budget[0]; ++step)
                 coordinated[0][step] = path[0][budget[0]][step];
             for (int step = 0; step < budget[1]; ++step)
                 coordinated[1][step] = path[1][budget[1]][step];
 
-            int lead_actions[2][S]{};
+            int lead_actions[2][STEPS]{};
             int lead_length[2]{};
             lead_length[first] = budget[first];
             for (int step = 0; step < budget[first]; ++step)
@@ -1238,7 +1251,7 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
                                                   pot_weight);
             Mask289 blocked = enemy_mask;
             blocked.set(lead.position[first]);
-            PlanResult tail[S + 1];
+            PlanResult tail[STEPS + 1];
             plan(position[second], gold[second], budget[second], blocked,
                  npc_count, pot_weight, second, &lead.harvest, lead.cleared,
                  std::max(6, BEAM_WIDTH), tail);
@@ -1273,7 +1286,7 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
         output.actions[cursor++] = best_actions[0][step];
     for (int step = 0; step < best_length[1]; ++step)
         output.actions[cursor++] = best_actions[1][step];
-    while (cursor < S) output.actions[cursor++] = STAY;
+    while (cursor < STEPS) output.actions[cursor++] = STAY;
     output.k = best_k;
     output.order = best_order;
     output.vp = vision(round, gold, best_result.position, std::max(0, input.gold_opp));
@@ -1290,14 +1303,14 @@ Strategy strategy_instance;
 #define GOLD_RUSH_EXPORT
 #endif
 
-extern "C" GOLD_RUSH_EXPORT GameOutput moveDecision(const GameInput* input) noexcept {
+extern "C" GOLD_RUSH_EXPORT GameOutput moveDecision(const GameInput* input) {
     const GameOutput fallback = stay_output();
     if (input == nullptr) return fallback;
     try {
         const GameOutput result = strategy_instance.decide(*input);
         for (const int action : result.actions)
             if (action < 0 || action > STAY) return fallback;
-        if (result.k < 0 || result.k > S ||
+        if (result.k < 0 || result.k > STEPS ||
             (result.order != 0 && result.order != 1) ||
             result.vp < 0 || result.vp > 2) return fallback;
         return result;

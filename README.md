@@ -76,10 +76,120 @@ python3 -B -m unittest -v test_strategy.py
 - 支持 list、flat buffer、ctypes 17x17 grid；保留任何异常时的合法全停兜底。
 
 尚未声称完成：真实固定先手自对弈、中心 12 轮巡逻环的 A/B、正式地图的
-热点学习收益，以及官方 `game_api.h` 下的 C++ 编译验证。C++ 源码、兼容头、
-动态加载测试器和 Makefile 已加入；当前工作区没有 C++ 编译器，必须按
-`OFFICIAL_SO_GUIDE.md` 在官方开发机完成首次编译、ASan/UBSan 与 P90 实测后，
-才能把生成的 `player.so` 视为可上传产物。
+热点学习收益。
+
+### 官方 `game_api.h` 编译验证（2026-08-14，已通过）
+
+已用官方 `game_api.h` + 官方 `Makefile` 完成编译验证，修复了 3 个会在官方
+服务器上直接失败、但本地完全看不出来的问题。详见下面「提交打包」一节。
+
+```text
+g++ -std=c++17 -O2 -march=native -fPIC -Wall -shared -o player.so player.cpp
+→ 0 error，0 warning
+nm -D --defined-only player.so | grep moveDecision  →  T moveDecision
+./sotest ./player.so  →  PASS calls=500 median=7.1us p90=8.4us p99=12us
+python3 -m unittest test  →  Ran 25 tests，OK
+```
+
+C++ 版 P90 约 **8.4us**，比 Python v2.2 快约两个数量级，先手几乎稳拿。
+（该数字来自 aarch64 沙箱，与 README 上方 Python 表格不同机，不可横比；
+正式数据仍以官方机 `make test` 与上传后的官方 P90 为准。）
+
+仍需在官方开发机按 `OFFICIAL_SO_GUIDE.md` 跑一次 ASan/UBSan 与 x86-64 下的
+`make test`，再把 `player.so` 视为可上传产物。
+
+---
+
+## 提交打包（官方 game.zip）
+
+官方 zip 含 7 个文件：`game_api.h`、`game_api.py`、`Makefile`、`player.cpp`、
+`player.py`、`README.md`、`test.py`。本仓库的对应关系：
+
+| 仓库文件 | zip 内文件名 |
+|---|---|
+| `strategy.cpp` | `player.cpp` |
+| `strategy.py` | `player.py` |
+| `test_strategy.py` | `test.py` |
+
+**其余文件（`game_api.h`、`game_api.py`、`Makefile`）保持官方原样，不要替换。**
+
+### 曾经踩过的 3 个坑（已全部修复，勿回退）
+
+**坑 1：官方 `game_api.h` 在全局作用域定义了 `S` 和 `MAX_NPCS`。**
+`strategy.cpp` 的匿名 namespace 里原本也有 `constexpr int S = 6;` 和
+`constexpr int MAX_NPCS = 16;`。匿名 namespace 的成员在全局作用域可见，于是
+所有裸写的 `S` 都变成二义性引用：
+
+```text
+error: reference to 'S' is ambiguous
+  candidates are: 'constexpr const int {anonymous}::S'
+                  'constexpr const int S'   // game_api.h:7
+```
+
+已把内部常量改名为 `STEPS` 和 `NPC_CAP`。**新增全局常量前务必先确认没和官方
+头文件的 `GRID_SIZE / MAX_NPCS / S / REGION_COUNT` 撞名。**
+
+**坑 2：`moveDecision` 定义带了 `noexcept`，官方声明没有。**
+
+```text
+error: declaration of 'GameOutput moveDecision(const GameInput*) noexcept'
+       has a different exception specifier
+```
+
+C++ 不允许在已有无 `noexcept` 声明后再加 `noexcept`。已去掉 `noexcept`，函数体
+内的 `try/catch(...)` 全停兜底保留不变，行为不受影响。
+
+**为什么本地没发现坑 1/2**：`game_api_compat.h` 当初为了「不污染全局命名空间」
+用了 `GOLD_RUSH_N/S/A` 这套私有名字，且没有声明 `moveDecision`，正好把两个错误
+全遮住了。现已改为与官方头文件**逐字同名**的镜像。**不要再为了整洁改这些名字。**
+
+**坑 3：`make` 之后 `player.so` 会遮蔽 `player.py`。**
+Python 的 FileFinder 先找扩展模块再找源码，所以目录里同时有 `player.so` 和
+`player.py` 时，`import player` 会加载 `.so` 并报：
+
+```text
+ImportError: dynamic module does not define module export function (PyInit_player)
+```
+
+`test_strategy.py` / `benchmark_strategy.py` 已改为先试 `import strategy`，失败时
+用 `importlib` **按路径**加载 `player.py`，两种目录布局都能跑。
+**推论：如果最终提交 Python 版，务必确保包里没有 `player.so`。**
+
+**坑 4：GCC 14 对 `std::sort` 小数组报 `-Warray-bounds` 假阳性。**
+官方开发机（`8.153.76.120`）是 **GCC 14**，比本地新。`classify_roles` 里对
+`target[4]` 调 `std::sort`：
+
+```text
+warning: array subscript 16 is outside array bounds of 'Target [4]' [-Warray-bounds=]
+note: at offset 128 into object 'target' of size 32
+```
+
+**这是 warning 不是 error，`player.so` 照常生成，代码本身也没有越界**——`count`
+由 `for (action = 0; action < 4; ++action)` 限死 ≤ 4。但 GCC ≥ 12 无法穿过内联后的
+`std::sort` 证明这一点：`__final_insertion_sort` 里有一条 `__first + 16` 分支，在
+这里是死代码，静态分析仍会报。（同文件另一处 `std::sort` 作用于 32 元素数组，
+`+16` 确实在界内，所以不报。）
+
+已改为手写降序插入排序：消除 warning，且 n ≤ 4 时比 `std::sort` 更快。校验和
+与改前完全一致（`3332927686`），行为未变。
+
+**注意本地 GCC 版本可能低于官方机而漏报。** 打包前建议加严编译一次：
+
+```bash
+g++ -std=c++17 -O3 -fPIC -Wall -Wextra -Warray-bounds=2 -Wstringop-overflow=4 \
+    -shared -o /dev/null player.cpp
+```
+
+### 打包前必跑的验证
+
+```bash
+make clean && make            # 0 error 0 warning
+nm -D --defined-only player.so | grep moveDecision   # 必须是未改名的 T moveDecision
+python3 -B -m unittest test   # 25 tests OK
+```
+
+另注：官方 `Makefile` 带 `-march=native`。FAQ 称编译机与运行机一致，因此可用；
+但若上传后出现 illegal instruction，第一个要去掉的就是它。
 
 ---
 

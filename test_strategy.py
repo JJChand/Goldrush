@@ -2,7 +2,24 @@ import ctypes
 import random
 import unittest
 
-import strategy
+# The submission zip renames strategy.py -> player.py (and this file -> test.py),
+# so support both layouts.
+#
+# Note: a plain `import player` is NOT safe here. Once `make` has produced
+# player.so in the same directory, Python's FileFinder resolves extension
+# modules before source files, so `import player` picks up the C++ .so and dies
+# with "dynamic module does not define module export function (PyInit_player)".
+# Load player.py by explicit path instead.
+try:
+    import strategy
+except ModuleNotFoundError:  # pragma: no cover - submission layout
+    import importlib.util
+    import pathlib
+
+    _player_py = pathlib.Path(__file__).resolve().with_name("player.py")
+    _spec = importlib.util.spec_from_file_location("_goldrush_player", _player_py)
+    strategy = importlib.util.module_from_spec(_spec)
+    _spec.loader.exec_module(strategy)
 
 
 N = strategy.N

@@ -9,7 +9,10 @@ import argparse
 import statistics
 import time
 
-import strategy
+try:
+    import strategy
+except ModuleNotFoundError:  # pragma: no cover - submission layout
+    import player as strategy
 
 
 def percentile(sorted_values, q):
