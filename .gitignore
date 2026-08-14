@@ -1,2 +1,6 @@
 __pycache__/
 *.py[cod]
+player.so
+player_asan.so
+test_strategy_cpp
+test_strategy_cpp_asan

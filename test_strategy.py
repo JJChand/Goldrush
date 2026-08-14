@@ -100,6 +100,149 @@ class StrategyRuleTests(unittest.TestCase):
         self.assertAlmostEqual(poor, 0.05)
         self.assertLess(rich, poor)
 
+    def test_whittle_tables_are_stock_monotone_and_competition_urgent(self):
+        player = strategy.Player()
+        quantum = strategy.INDEX_SUBSIDY_STEP
+        for by_hazard in player.index_tables:
+            for table in by_hazard:
+                decoded = [x * quantum for x in table]
+                self.assertEqual(decoded, sorted(decoded))
+            for stock in range(len(by_hazard[0])):
+                self.assertLessEqual(by_hazard[0][stock],
+                                     by_hazard[1][stock])
+                self.assertLessEqual(by_hazard[1][stock],
+                                     by_hazard[2][stock])
+
+    def test_whittle_priority_raises_cells_exposed_to_competition(self):
+        player = strategy.Player()
+        low = 1 * N + 1       # region 2
+        high = 8 * N + 1      # region 3
+        player.est[low] = player.est[high] = 10.0
+        player.outer_rate[low] = player.outer_rate[high] = 0.08
+        player.region_competition[2] = 0.0
+        player.region_competition[3] = 0.30
+        player._index_priority(100, [], [])
+        self.assertGreater(player.priority[high], player.priority[low])
+
+    def test_whittle_priority_values_waiting_at_fast_growth_cells(self):
+        player = strategy.Player()
+        slow = 1 * N + 1
+        fast = 1 * N + 2
+        player.est[slow] = player.est[fast] = 10.0
+        player.outer_rate[slow] = 0.03
+        player.outer_rate[fast] = 1.0
+        player.index_rate_class[slow] = strategy._rate_class(0.03)
+        player.index_rate_class[fast] = strategy._rate_class(1.0)
+        player.region_competition[2] = 0.0
+        player._index_priority(100, [], [])
+        self.assertGreater(player.priority[slow], player.priority[fast])
+
+    def test_whittle_continuation_premium_disappears_on_final_round(self):
+        player = strategy.Player()
+        a, b = 1 * N + 1, 8 * N + 1
+        player.est[a] = player.est[b] = 10.0
+        player.outer_rate[a], player.outer_rate[b] = 0.03, 2.0
+        player.region_competition[2] = 0.0
+        player.region_competition[3] = 0.30
+        player._index_priority(499, [], [])
+        self.assertAlmostEqual(player.priority[a], player.priority[b])
+
+    def test_potential_field_uses_index_priority_as_its_source_value(self):
+        player = strategy.Player()
+        source = 8 * N + 8
+        player.est[source] = 20.0
+        player.priority[source] = 7.0
+        player._potential()
+        self.assertEqual(player.pot_source[source], source)
+        self.assertEqual(player.pot[source], 7.0)
+
+    def test_beam_breaks_equal_gold_tie_toward_more_urgent_cell(self):
+        player = strategy.Player()
+        player.round = 100
+        player.turn_risk_rate = (0.0,) * 6
+        player.turn_fog_penalty = 0.0
+        player.terrain_known = [True] * NN
+        start = 3 * N + 3
+        low = 3 * N + 2       # region 2
+        high = 4 * N + 3      # region 3
+        player.est[low] = player.est[high] = 10.0
+        player.index_rate_class[low] = player.index_rate_class[high] = 1
+        player.region_competition[2] = 0.0
+        player.region_competition[3] = 0.30
+        player._index_priority(100, [], [])
+        player._potential()
+        curve = player._plan(
+            start, 0, 1, 0, [0] * NN, 1.0, unit_id=1,
+        )
+        self.assertEqual(curve[1][4], high)
+
+    def test_roles_are_cycle_sticky_but_swap_after_wallet_reversal(self):
+        player = strategy.Player()
+        player.turn_risk_rate = (0.0,) * 6
+        positions = [8 * N + 7, 8 * N + 9]
+        player._classify_roles(40, [0, 100], positions, [])
+        self.assertEqual((player.turn_scout, player.turn_collector), (0, 1))
+
+        # A small reversal does not cause role thrashing inside the cycle.
+        player._classify_roles(41, [15, 10], positions, [])
+        self.assertEqual(player.turn_scout, 0)
+
+        # A material reversal promotes the now-poorer unit to scout.
+        player._classify_roles(42, [50, 10], positions, [])
+        self.assertEqual((player.turn_scout, player.turn_collector), (1, 0))
+
+    def test_poor_scout_values_clearing_a_known_bomb(self):
+        player = strategy.Player()
+        player.round = 40
+        player.turn_risk_rate = (0.0,) * 6
+        player.turn_fog_penalty = 0.0
+        player.terrain_known = [True] * NN
+        start = 8 * N + 8
+        target = start + 1
+        player.bomb[target] = True
+        player._classify_roles(40, [0, 100], [start, start + 2], [])
+        self.assertGreater(player.turn_scout_bonus[target], 0.0)
+
+        curve = player._plan(
+            start, 0, 1, 0, [0] * NN, 0.0, unit_id=0,
+        )
+        self.assertEqual(curve[1][4], target)
+        self.assertGreater(curve[1][0], 0.0)
+
+    def test_scout_first_can_clear_a_bomb_for_collector_same_turn(self):
+        player = strategy.Player()
+        player.round = 40
+        player.turn_risk_rate = (0.0,) * 6
+        player.turn_fog_penalty = 0.0
+        player.terrain_known = [True] * NN
+        bomb = 8 * N + 8
+        starts = [bomb - 1, bomb + 1]
+        player.bomb[bomb] = True
+        player._classify_roles(40, [0, 100], starts, [])
+        actions = ((3, 0), (2,))  # scout enters+leaves; collector follows
+        scout_first = player._joint_score(
+            starts, [0, 100], actions, 0, 0, [0] * NN, 0.0,
+        )
+        collector_first = player._joint_score(
+            starts, [0, 100], actions, 1, 0, [0] * NN, 0.0,
+        )
+        self.assertGreater(scout_first[0], collector_first[0])
+        self.assertTrue(scout_first[3] & strategy.BIT[bomb])
+
+    def test_visible_enemy_creates_small_interdiction_targets(self):
+        player = strategy.Player()
+        player.turn_risk_rate = (0.0,) * 6
+        player.terrain_known = [True] * NN
+        enemy = 8 * N + 8
+        predicted_step = enemy + 1
+        player.pot[predicted_step] = 10.0
+        player._classify_roles(
+            40, [0, 100], [enemy - 2, enemy + 4], [(8, 8)],
+        )
+        self.assertGreater(player.turn_denial[predicted_step], 0.0)
+        self.assertLessEqual(player.turn_denial[predicted_step],
+                             strategy.DENIAL_CAP)
+
     def test_pending_belief_changes_require_matching_endpoints(self):
         player = strategy.Player()
         cell = 8 * N + 8

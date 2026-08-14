@@ -26,13 +26,19 @@ Design summary
    outer-region hotspots online, and uses global snapshots as raid signals.
 2. Bomb knowledge expires at each observed 20-round refresh.  Unknown-bomb risk
    depends on region, cycle phase, and the individual unit's wallet.
-3. A compact beam produces one marginal path curve per unit.  A cheap joint
+3. Dynamic roles assign the poorer unit to scouting, cheap bomb clearing, and
+   small high-confidence interdiction targets while the richer unit harvests.
+   The identity is stable inside a bomb cycle unless wallets clearly reverse.
+4. A numerical Whittle-like index values the opportunity cost of postponing
+   each harvest.  Its small single-cell Bellman tables are built once; turns
+   only perform O(1) table lookups and the route planner keeps real gold units.
+5. A compact beam produces one marginal path curve per unit.  A cheap joint
    simulator then considers all seven move splits and both internal orders, so
    shared gold, bombs, trampling, and collisions are priced once rather than by
    two additional beam searches.
-4. A linear max-decay transform replaces the per-round heap Dijkstra.  It is the
+6. A linear max-decay transform replaces the per-round heap Dijkstra.  It is the
    exact Manhattan potential on an open grid; the short beam handles known walls.
-5. MoveDecision can never raise: a legal all-stay decision remains the fallback.
+7. MoveDecision can never raise: a legal all-stay decision remains the fallback.
 
 Every tunable lives in the CONFIG block and can be overridden per instance.
 """
@@ -64,10 +70,9 @@ CENTER_LO, CENTER_HI = 4, 12   # the "center 9x9" that regenerates gold each rou
 # ----------------------------------------------------------------------------
 # CONFIG — tune these after watching real matches
 # ----------------------------------------------------------------------------
-# Width 4 is the latency-first setting: it cuts roughly 10% from P90 versus
-# width 6 while the joint evaluator recovers much of the coordination quality
-# that v1 bought with two additional width-16 beam calls.
-BEAM_WIDTH = 4
+# Width 3 absorbs the Whittle lookup cost while retaining sub-millisecond P90;
+# endpoint-diverse pruning and the residual joint replan preserve coordination.
+BEAM_WIDTH = 3
 GAMMA = 0.72           # potential decay per step of distance
 POT_W = 0.35           # weight of the terminal potential in a plan's score
 
@@ -96,6 +101,31 @@ OPP_SPEED = 5.0        # opponent unit effective speed
 FOG_STEP = 0.6
 OPENING_SCOUT_ROUNDS = 25
 ENDGAME_ROUNDS = 15
+
+# Reset-process / Whittle-index target priority.  GoldRush has multi-valued
+# stock and a 65% partial reset rather than the paper's binary observation
+# state, so we solve a small discounted single-cell subsidy problem numerically.
+# Tables are shared by every Player instance and are never rebuilt per turn.
+INDEX_WEIGHT = 0.75
+INDEX_BETA = 0.94
+INDEX_STOCK_STEP = 2.0
+INDEX_MAX_STOCK = 60
+INDEX_SUBSIDY_STEP = 0.25
+INDEX_MAX_SUBSIDY = 64.0
+INDEX_RATES = (0.03, 0.08, CENTER_REGEN, 0.40, 1.0, 2.0)
+INDEX_HAZARDS = (0.0, 0.12, 0.30)
+BASE_COMP_HAZARD = (0.0, 0.12, 0.04, 0.04, 0.04, 0.04)
+
+# Dynamic role policy.  The poorer unit becomes the scout/clearer for a bomb
+# cycle; it keeps collecting normally, but receives extra utility for useful
+# information, cheap bomb removal, and high-confidence opponent denial.
+SCOUT_BOMB_ROUNDS = 5
+ROLE_TIE_GAP = 5
+ROLE_SWAP_GAP = 20
+SCOUT_INFO_BONUS = 0.75
+SCOUT_CLEAR_SHARE = 0.70
+DENIAL_WEIGHT = 0.12
+DENIAL_CAP = 2.0
 
 # Observed standing bomb rates by official region.  A phase multiplier accounts
 # for bombs disappearing after being triggered within a 20-round cycle.
@@ -163,7 +193,200 @@ POT_V_BACK = tuple(range(NN - N - 1, -1, -1))
 # Manhattan distance table; the plan scorer indexes it millions of times.
 DIST = [[abs(ROW[_j] - ROW[_i]) + abs(COL[_j] - COL[_i]) for _j in range(NN)]
         for _i in range(NN)]
+REACH6 = [tuple(j for j in range(NN) if DIST[i][j] <= S) for i in range(NN)]
+REACH3 = [tuple((j, DIST[i][j]) for j in range(NN) if DIST[i][j] <= 3)
+          for i in range(NN)]
 SNAP_LO, SNAP_HI = 0.15, 10.0  # allow a real outer burst to trigger a raid
+
+
+# Generated offline by `_build_index_table` below and quarter-unit encoded.
+# A decoded table entry is the smallest passive subsidy for which waiting is
+# optimal in that stock state--the numerical analogue of the Whittle index.
+_INDEX_TABLES = None
+_PRIORITY_TABLE_CACHE = {}
+_INDEX_TABLE_HEX = (
+    ('00060b10151b20252a2f353a3f44494f54595e63696e73787d83888d92979e',
+     '00070c11161c21262b30363b40454a50555a5f646a6f74797e84898e93989e',
+     '00070c11171c21262b31363b40454b50555a5f656a6f74797f84898e93999e'),
+    ('00050a0f14191e23282d33383d42474d52575c61676c71767b81868b90959e',
+     '00060b11161b20252b30353a3f454a4f54595f64696e73797e83888d93989e',
+     '00070c11161b21262b30353b40454a4f555a5f64696f74797e83898e93989e'),
+    ('0004080c11161b20252a2f343a3f44494e54595e63686e73787d82888d929e',
+     '00060a0f151a1f24292f34393e43494e53585d63686d72777d82878c91979e',
+     '00060b11161b20252b30353a3f454a4f54595f64696e73797e83888d93989e'),
+    ('000305090d1115191e23272c31363b40454a50555a5f64696f74797e83889e',
+     '0004080d12171c21272c31363b41464b50555b60656a6f757a7f84898f949e',
+     '00050a10151a1f24292f34393e43494e53585d63686d72777d82878c91979e'),
+    ('00020305080a0d1114181b1f24282c3035393e42474c51555a5f64696e739e',
+     '000305090d11161b20252a2f34393e44494e53585d63686d72777d82878c9e',
+     '0004080d12171c21262c31363b40464b50555a60656a6f747a7f84898e949e'),
+    ('000102030507080b0d0f1215181b1f2226292d3134383c4044494d51555a9e',
+     '00020406090d1014181c21252a2f34383d42474d52575c61666b70767b809e',
+     '0003060a0e13181d22272c31363b41464b50555b60656a6f757a7f84898f9e'),
+)
+
+
+def _expected_pickup(gold):
+    """Smooth fog-belief pickup; exact visible piles remain ceil'ed elsewhere."""
+    if gold <= 0.0:
+        return 0.0
+    if gold < 1.0:
+        return gold
+    value = PICK_RATE * gold + (1.0 - PICK_RATE)
+    return gold if value > gold else value
+
+
+def _rate_class(rate):
+    """Nearest fixed index-rate bucket, using precomputed midpoints."""
+    if rate < 0.055:
+        return 0
+    if rate < 0.1234:
+        return 1
+    if rate < 0.2834:
+        return 2
+    if rate < 0.70:
+        return 3
+    if rate < 1.50:
+        return 4
+    return 5
+
+
+def _interp_desc(value, states):
+    """Return lower bin and fraction for a stock value on the DP grid."""
+    scaled = value / INDEX_STOCK_STEP
+    lower = int(scaled)
+    if lower >= states - 1:
+        return states - 1, 0.0
+    return lower, scaled - lower
+
+
+def _build_index_table(rate, hazard):
+    """Solve one discounted reset arm over a monotone subsidy sweep.
+
+    Passive stock grows and may be partially harvested by a competitor.  Active
+    stock pays our pickup immediately, leaves 35%, then faces the same next-turn
+    dynamics.  Sweeping the passive subsidy records the first value at which
+    every stock state joins the passive set, matching the paper's definition.
+    """
+    states = INDEX_MAX_STOCK // int(INDEX_STOCK_STEP) + 1
+    stock = [i * INDEX_STOCK_STEP for i in range(states)]
+    reward = [_expected_pickup(g) for g in stock]
+
+    # Precompute the four interpolated continuations used by each Bellman row:
+    # passive/no-rival, passive/rival, active/no-rival, active/rival.
+    trans = []
+    for g, pickup in zip(stock, reward):
+        passive_full = min(INDEX_MAX_STOCK, g + rate)
+        passive_hit = passive_full - _expected_pickup(passive_full)
+        active_full = min(INDEX_MAX_STOCK, g - pickup + rate)
+        active_hit = active_full - _expected_pickup(active_full)
+        trans.append((_interp_desc(passive_full, states),
+                      _interp_desc(passive_hit, states),
+                      _interp_desc(active_full, states),
+                      _interp_desc(active_hit, states)))
+
+    def at(values, desc):
+        lower, frac = desc
+        if not frac or lower == states - 1:
+            return values[lower]
+        return values[lower] + frac * (values[lower + 1] - values[lower])
+
+    result = [None] * states
+    remaining = states
+    values = [0.0] * states
+    subsidy = 0.0
+    keep = 1.0 - hazard
+    beta = INDEX_BETA
+    while subsidy <= INDEX_MAX_SUBSIDY and remaining:
+        # The previous subsidy's value function is an effective warm start.
+        for _ in range(80):
+            updated = [0.0] * states
+            delta = 0.0
+            for i in range(states):
+                p0, p1, a0, a1 = trans[i]
+                wait_future = keep * at(values, p0) + hazard * at(values, p1)
+                act_future = keep * at(values, a0) + hazard * at(values, a1)
+                wait = subsidy + beta * wait_future
+                active = reward[i] + beta * act_future
+                value = wait if wait >= active else active
+                updated[i] = value
+                change = value - values[i]
+                if change < 0.0:
+                    change = -change
+                if change > delta:
+                    delta = change
+            values = updated
+            if delta < 1e-7:
+                break
+
+        # Evaluate the converged action advantage using the same value vector.
+        for i in range(states):
+            if result[i] is not None:
+                continue
+            p0, p1, a0, a1 = trans[i]
+            wait_future = keep * at(values, p0) + hazard * at(values, p1)
+            act_future = keep * at(values, a0) + hazard * at(values, a1)
+            if subsidy + beta * wait_future >= reward[i] + beta * act_future:
+                result[i] = subsidy
+                remaining -= 1
+        subsidy += INDEX_SUBSIDY_STEP
+
+    for i in range(states):
+        if result[i] is None:
+            result[i] = INDEX_MAX_SUBSIDY
+        # Numerical/rounding ties can create tiny inversions.  The reset arm is
+        # used as an indexable model, so preserve its required monotone order.
+        if i and result[i] < result[i - 1]:
+            result[i] = result[i - 1]
+    return tuple(result)
+
+
+def _index_tables():
+    global _INDEX_TABLES
+    if _INDEX_TABLES is None:
+        _INDEX_TABLES = tuple(tuple(bytes.fromhex(row) for row in rate)
+                              for rate in _INDEX_TABLE_HEX)
+    return _INDEX_TABLES
+
+
+def _priority_tables(weight):
+    """Expand quarter-encoded indices into direct 0.25-stock lookup tables."""
+    cached = _PRIORITY_TABLE_CACHE.get(weight)
+    if cached is not None:
+        return cached
+    stock_weight = 1.0 - weight
+    normal = []
+    normal_ratio = []
+    for by_hazard in _index_tables():
+        for raw in by_hazard:
+            row = []
+            ratios = []
+            for q in range(INDEX_MAX_STOCK * 4 + 1):
+                gold = q * 0.25
+                lower, remainder = divmod(q, 8)  # 2-gold DP bins
+                if lower >= 30:
+                    index = raw[-1] * INDEX_SUBSIDY_STEP
+                else:
+                    frac = remainder * 0.125
+                    encoded = raw[lower] + frac * (raw[lower + 1] - raw[lower])
+                    index = encoded * INDEX_SUBSIDY_STEP
+                value = stock_weight * gold + weight * index
+                row.append(value)
+                ratios.append(value / gold if gold else 0.0)
+            normal.append(tuple(row))
+            normal_ratio.append(tuple(ratios))
+    final = []
+    final_ratio = []
+    for q in range(INDEX_MAX_STOCK * 4 + 1):
+        gold = q * 0.25
+        immediate = _expected_pickup(gold)
+        value = stock_weight * gold + weight * immediate
+        final.append(value)
+        final_ratio.append(value / gold if gold else 0.0)
+    cached = (tuple(normal), tuple(final),
+              tuple(normal_ratio), tuple(final_ratio))
+    _PRIORITY_TABLE_CACHE[weight] = cached
+    return cached
 
 
 # ----------------------------------------------------------------------------
@@ -208,6 +431,14 @@ class Player:
         self.FOG_STEP = FOG_STEP
         self.OPENING_SCOUT_ROUNDS = OPENING_SCOUT_ROUNDS
         self.ENDGAME_ROUNDS = ENDGAME_ROUNDS
+        self.INDEX_WEIGHT = INDEX_WEIGHT
+        self.SCOUT_BOMB_ROUNDS = SCOUT_BOMB_ROUNDS
+        self.ROLE_TIE_GAP = ROLE_TIE_GAP
+        self.ROLE_SWAP_GAP = ROLE_SWAP_GAP
+        self.SCOUT_INFO_BONUS = SCOUT_INFO_BONUS
+        self.SCOUT_CLEAR_SHARE = SCOUT_CLEAR_SHARE
+        self.DENIAL_WEIGHT = DENIAL_WEIGHT
+        self.DENIAL_CAP = DENIAL_CAP
         self.VIS_FRAC = VIS_FRAC
         self.VIS_WARMUP = VIS_WARMUP
         self.BLIND_BONUS = BLIND_BONUS
@@ -234,8 +465,13 @@ class Player:
         self.gold_round = [-1] * NN       # direct/snapshot observation or harvest
         self.bomb_safe_round = [-1] * NN # seen/traversed safe in this bomb cycle
         self.outer_rate = [self.OUTER_REGEN] * NN
+        self.index_rate_class = [2 if IS_CENTER[i] else
+                                 _rate_class(self.OUTER_REGEN)
+                                 for i in range(NN)]
         self.est = [0.0] * NN             # current per-cell estimate
         self.growth_work = [0.0] * NN     # snapshot-only scratch buffer
+        self.priority = [0.0] * NN        # Whittle/stock blended target value
+        self.priority_ratio = [0.0] * NN  # cheap residual correction in beams
         self.pot = [0.0] * NN             # max-decayed target value
         self.pot_source = [-1] * NN       # source cell responsible for pot[i]
         self.region_scale = [1.0] * 6     # scales uncertain growth, never stock
@@ -243,11 +479,21 @@ class Player:
         self.region_generated = [0.0] * 6
         self.region_collected = [0.0] * 6
         self.region_congestion = [0.0] * 6
+        self.region_competition = list(BASE_COMP_HAZARD)
+        self.index_tables = _index_tables()
+        (self.index_priority_tables, self.index_final_priority,
+         self.index_priority_ratios, self.index_final_ratios) = \
+            _priority_tables(self.INDEX_WEIGHT)
         self.last_bomb_reset = -1
         self.prev_total = 0
         self.income = 0.0                 # EMA of gold gained per round
         self.vision_spend = 0
         self.pending = None               # confirmed from next round's endpoints
+        self.role_cycle = -1
+        self.turn_scout = 0
+        self.turn_collector = 1
+        self.turn_scout_bonus = [0.0] * NN
+        self.turn_denial = [0.0] * NN
         self.round = 0
 
     # --------------------------------------------------------- entry point --
@@ -279,6 +525,7 @@ class Player:
 
         self._observe(grid, rnd)
         self._estimate(rnd, gi, u, npcs, enemies)
+        self._index_priority(rnd, npcs, enemies)
         self._potential()
 
         # ------------------------------------------------ plan the 6 moves --
@@ -303,12 +550,15 @@ class Player:
         self.turn_risk_rate = tuple(rate * phase for rate in BOMB_RATE)
         self.turn_fog_penalty = (0.0 if rnd < self.OPENING_SCOUT_ROUNDS
                                  else self.FOG_STEP)
+        self._classify_roles(rnd, golds, idx, enemies)
 
         # Two marginal curves replace v1's four beam calls.  The evaluator
         # below jointly prices every k/order pair, including shared harvests,
         # bomb removal and the moving own-unit collision constraint.
-        curve0 = self._plan(idx[0], golds[0], S, enemy_mask, npc_cnt, pot_w)
-        curve1 = self._plan(idx[1], golds[1], S, enemy_mask, npc_cnt, pot_w)
+        curve0 = self._plan(idx[0], golds[0], S, enemy_mask, npc_cnt, pot_w,
+                            unit_id=0)
+        curve1 = self._plan(idx[1], golds[1], S, enemy_mask, npc_cnt, pot_w,
+                            unit_id=1)
         paths0 = [self._decode_actions(curve0[d][2], d) for d in range(S + 1)]
         paths1 = [self._decode_actions(curve1[d][2], d) for d in range(S + 1)]
 
@@ -364,7 +614,7 @@ class Player:
                     idx[second], golds[second], budgets[second],
                     enemy_mask | BIT[lead_final], npc_cnt, pot_w,
                     pre_harv=lead_result[2], initial_cleared=lead_result[4],
-                    beam_width=max(6, self.BEAM_WIDTH))
+                    beam_width=max(6, self.BEAM_WIDTH), unit_id=second)
                 tail = self._decode_actions(
                     tail_curve[budgets[second]][2], budgets[second])
                 coordinated = [seed_actions[0], seed_actions[1]]
@@ -389,6 +639,113 @@ class Player:
             actions[i] = code % 5
             code //= 5
         return tuple(actions)
+
+    def _classify_roles(self, rnd, golds, positions, enemies):
+        """Define this turn's scout/clearer and collector behavior.
+
+        The identity is sticky within a 20-round bomb cycle.  It changes at a
+        refresh boundary, or earlier only when the nominal scout has become
+        materially richer than its partner.  Roles shape utility rather than
+        imposing hard routes, so both units may still take profitable gold.
+        """
+        cycle = rnd // 20
+        scout = self.turn_scout
+        if cycle != self.role_cycle:
+            g0, g1 = golds[0], golds[1]
+            if g0 + self.ROLE_TIE_GAP < g1:
+                scout = 0
+            elif g1 + self.ROLE_TIE_GAP < g0:
+                scout = 1
+            elif enemies:
+                enemy_cells = [r * N + c for r, c in enemies]
+                d0 = min(DIST[positions[0]][e] for e in enemy_cells)
+                d1 = min(DIST[positions[1]][e] for e in enemy_cells)
+                scout = 0 if d0 <= d1 else 1
+            else:
+                # With similar wallets, send the unit with more unexplored
+                # terrain in its six-step neighbourhood.
+                f0 = sum(not self.terrain_known[i]
+                         for i in REACH6[positions[0]])
+                f1 = sum(not self.terrain_known[i]
+                         for i in REACH6[positions[1]])
+                scout = 0 if f0 >= f1 else 1
+            self.role_cycle = cycle
+        else:
+            other = 1 - scout
+            if golds[scout] > golds[other] + self.ROLE_SWAP_GAP:
+                scout = other
+
+        collector = 1 - scout
+        self.turn_scout, self.turn_collector = scout, collector
+
+        phase = rnd % 20
+        future_rounds = 499 - rnd
+        if rnd < self.OPENING_SCOUT_ROUNDS:
+            info_strength = 1.0
+        elif phase < self.SCOUT_BOMB_ROUNDS:
+            info_strength = 0.60
+        else:
+            info_strength = 0.0
+        if future_rounds < self.ENDGAME_ROUNDS:
+            info_strength *= max(0.0, future_rounds / self.ENDGAME_ROUNDS)
+        # Bomb clearing is deliberately front-loaded: after the first five
+        # rounds, normal wallet-scaled risk still applies, but we stop paying
+        # an extra role bonus for safety information that will soon expire.
+        clear_strength = (1.0 if phase < self.SCOUT_BOMB_ROUNDS else 0.0)
+
+        scout_bonus = [0.0] * NN
+        cycle_start = rnd - phase
+        scout_loss = math.ceil(BOMB_PCT * golds[scout]) if golds[scout] else 0
+        collector_loss = (math.ceil(BOMB_PCT * golds[collector])
+                          if golds[collector] else 0)
+        loss_gap = collector_loss - scout_loss
+        collector_dist = DIST[positions[collector]]
+        pot = self.pot
+        if info_strength > 0.0 or (loss_gap > 0 and clear_strength > 0.0):
+            for cell in REACH6[positions[scout]]:
+                if self.obstacle[cell]:
+                    continue
+                bonus = (self.SCOUT_INFO_BONUS * info_strength
+                         if not self.terrain_known[cell] else 0.0)
+                if (loss_gap > 0 and
+                        self.bomb_safe_round[cell] < cycle_start):
+                    probability = (1.0 if self.bomb[cell] else
+                                   self.turn_risk_rate[REGION_OF[cell]])
+                    if probability > 0.0:
+                        relevance = (1.0 if collector_dist[cell] <= S else 0.25)
+                        target_weight = 0.25 + pot[cell] / 6.0
+                        if target_weight > 1.0:
+                            target_weight = 1.0
+                        bonus += (self.SCOUT_CLEAR_SHARE * clear_strength *
+                                  loss_gap * probability * relevance *
+                                  target_weight)
+                scout_bonus[cell] = bonus
+        self.turn_scout_bonus = scout_bonus
+
+        # Interdiction stays deliberately small: reward only the two most
+        # valuable legal first-step candidates around each visible opponent.
+        denial = [0.0] * NN
+        if enemies:
+            scout_dist = DIST[positions[scout]]
+            for r, c in enemies:
+                enemy = r * N + c
+                candidates = []
+                for _, cell in NEIGH[enemy]:
+                    if (not self.obstacle[cell] and
+                            scout_dist[cell] <= S):
+                        candidates.append((pot[cell] + self.est[cell], cell))
+                candidates.sort(reverse=True)
+                for rank, (value, cell) in enumerate(candidates[:2]):
+                    if value <= 0.0:
+                        continue
+                    bonus = self.DENIAL_WEIGHT * value
+                    if bonus > self.DENIAL_CAP:
+                        bonus = self.DENIAL_CAP
+                    if rank:
+                        bonus *= 0.55
+                    if bonus > denial[cell]:
+                        denial[cell] = bonus
+        self.turn_denial = denial
 
     def _confirm_pending(self, rnd, actual_finals):
         """Commit last turn's belief changes only after endpoints confirm it."""
@@ -517,6 +874,7 @@ class Player:
                             sample = rate_max
                         learned = outer_rate[i] + alpha * (sample - outer_rate[i])
                         outer_rate[i] = learned if learned > 0.01 else 0.01
+                        self.index_rate_class[i] = _rate_class(outer_rate[i])
 
     # ---------------------------------------------------------- estimation --
     def _estimate(self, rnd, gi, units, npcs, enemies):
@@ -596,6 +954,21 @@ class Player:
                 self.region_generated[rid] = generated
                 self.region_collected[rid] = collected
                 self.region_congestion[rid] = congestion
+                # Turnover and bodies are aggregate evidence that waiting may
+                # lose a pile before our next visit.  This is a transition
+                # hazard in the single-cell arm, not a discount on money that
+                # we can still take first this turn.
+                turnover = collected / (collected + remain + 1.0)
+                presence = congestion / 7.0
+                if presence > 1.0:
+                    presence = 1.0
+                target_hazard = (BASE_COMP_HAZARD[rid] +
+                                 0.12 * turnover + 0.06 * presence)
+                if target_hazard > INDEX_HAZARDS[-1]:
+                    target_hazard = INDEX_HAZARDS[-1]
+                old_hazard = self.region_competition[rid]
+                self.region_competition[rid] = (0.65 * old_hazard +
+                                                0.35 * target_hazard)
 
                 available = remain - vis_sum[rid]
                 if available < 0.0:
@@ -656,15 +1029,88 @@ class Player:
             if comp:
                 est[i] *= disc ** comp
 
+    def _index_priority(self, rnd, npcs, enemies):
+        """Map every cell belief to a reset-process activation priority.
+
+        The Bellman work lives in shared tables.  Per turn this method selects
+        the closest learned generation/hazard class and linearly interpolates
+        only the stock dimension.  Nearby visible competitors raise the
+        passive-loss hazard; they do not reduce immediately collectible gold.
+        """
+        est, obstacle = self.est, self.obstacle
+        priority, ratio = self.priority, self.priority_ratio
+        lookup, final_lookup = self.index_priority_tables, self.index_final_priority
+        ratio_lookup, final_ratio_lookup = (self.index_priority_ratios,
+                                            self.index_final_ratios)
+        rate_classes = self.index_rate_class
+        remaining = 499 - rnd
+        horizon = 1.0
+        if remaining < self.ENDGAME_ROUNDS:
+            horizon = max(0.0, remaining / self.ENDGAME_ROUNDS)
+
+        # Populate only the <=3-step neighbourhoods of visible competitors;
+        # scanning every competitor from every board cell cost more than the
+        # rest of the table lookup combined.
+        local_boost = [0.0] * NN
+        for rival in npcs:
+            for cell, distance in REACH3[rival]:
+                local_boost[cell] += 0.04 * (4 - distance)
+        for r, c in enemies:
+            for cell, distance in REACH3[r * N + c]:
+                local_boost[cell] += 0.06 * (4 - distance)
+
+        regions = REGION_OF
+        region_hazard = self.region_competition
+        region_class = [0] * 6
+        for region in range(1, 6):
+            hazard = region_hazard[region]
+            region_class[region] = (2 if hazard >= 0.21 else
+                                    1 if hazard >= 0.06 else 0)
+        max_quarter = INDEX_MAX_STOCK * 4
+        for i in range(NN):
+            gold = est[i]
+            if gold <= 0.0 or obstacle[i]:
+                priority[i] = 0.0
+                ratio[i] = 0.0
+                continue
+
+            region = regions[i]
+            hazard_class = region_class[region]
+            boost = local_boost[i]
+            if boost:
+                hazard = region_hazard[region] + boost
+                hazard_class = (2 if hazard >= 0.21 else
+                                1 if hazard >= 0.06 else 0)
+
+            quarter = int(gold * 4.0 + 0.5)
+            if quarter > max_quarter:
+                quarter = max_quarter
+            table_id = rate_classes[i] * 3 + hazard_class
+            value = lookup[table_id][quarter]
+            value_ratio = ratio_lookup[table_id][quarter]
+            # An infinite-horizon index is meaningless after round 499.  Fade
+            # only its continuation premium; immediate pickup remains useful.
+            if horizon < 1.0:
+                final = final_lookup[quarter]
+                value = final + horizon * (value - final)
+                final_ratio = final_ratio_lookup[quarter]
+                value_ratio = final_ratio + horizon * (value_ratio - final_ratio)
+            if value < 0.0:
+                value = 0.0
+            elif value > INDEX_MAX_SUBSIDY:
+                value = INDEX_MAX_SUBSIDY
+            priority[i] = value
+            ratio[i] = value / gold if gold > INDEX_MAX_STOCK else value_ratio
+
     def _potential(self):
         """Linear max-product Manhattan distance transform.
 
-        Four one-dimensional passes compute max_g(est[g] * GAMMA^L1(x,g)).
+        Four one-dimensional passes compute max_g(priority[g] * GAMMA^L1(x,g)).
         This removes the heap and hundreds of tuple allocations from every
         turn.  Known walls are zeroed as destinations; the six-step planner is
         responsible for routing around them.
         """
-        pot = self.est.copy()
+        pot = self.priority.copy()
         source = [i if pot[i] > 0.0 else -1 for i in range(NN)]
         gamma = self.GAMMA
 
@@ -693,7 +1139,7 @@ class Player:
 
     # ------------------------------------------------------- move planning --
     def _plan(self, start, unit_gold, budget, blocked_mask, npc_cnt, pot_w,
-              pre_harv=None, initial_cleared=0, beam_width=None):
+              pre_harv=None, initial_cleared=0, beam_width=None, unit_id=-1):
         """Return the best marginal path for every depth from 0..budget.
 
         Expected fog gold stays fractional; only currently visible integer
@@ -711,6 +1157,9 @@ class Player:
 
         risk_rate = self.turn_risk_rate
         fog_penalty = self.turn_fog_penalty
+        is_scout = unit_id == self.turn_scout
+        scout_bonus = self.turn_scout_bonus if is_scout else None
+        denial = self.turn_denial if is_scout else None
 
         init = dict(pre_harv) if pre_harv else {}
         sig0 = 0
@@ -723,8 +1172,10 @@ class Player:
             if taken:
                 left = est[src] - taken
                 initial_potential = ((left if left > 0.0 else 0.0) *
-                                     gp[start][src])
+                                     self.priority_ratio[src] * gp[start][src])
         base = pot_w * initial_potential
+        if denial is not None:
+            base += denial[start]
         # result: score, wallet_delta, packed_actions, harvest, final_cell,
         #         traversed/cleared mask
         res = [(base, 0.0, 0, init, start, initial_cleared)] * (budget + 1)
@@ -777,6 +1228,8 @@ class Player:
                         if loss:
                             nutility -= loss
                             nwealth -= loss
+                        if scout_bonus is not None:
+                            nutility += scout_bonus[nxt]
 
                     if npc_cnt[nxt] >= TRAMPLE_NPC:
                         after_pickup = unit_gold + nwealth
@@ -798,8 +1251,11 @@ class Player:
                         source_taken = nharv.get(src, 0.0)
                         if source_taken:
                             left = est[src] - source_taken
-                            p = (left if left > 0.0 else 0.0) * gp[nxt][src]
+                            p = ((left if left > 0.0 else 0.0) *
+                                 self.priority_ratio[src] * gp[nxt][src])
                     score = nutility + pot_w * p
+                    if denial is not None:
+                        score += denial[nxt]
 
                     key = (nxt, nsig, ncleared)
                     previous = cand.get(key)
@@ -870,6 +1326,8 @@ class Player:
         obstacle, bombs_map = self.obstacle, self.bomb
         terrain, safe_round = self.terrain_known, self.bomb_safe_round
         risk_rate, fog_penalty = self.turn_risk_rate, self.turn_fog_penalty
+        scout = self.turn_scout
+        scout_bonus, denial = self.turn_scout_bonus, self.turn_denial
         rnd = self.round
         cycle_start = rnd - rnd % 20
 
@@ -917,6 +1375,8 @@ class Player:
                     if loss:
                         utility -= loss
                         wallets[unit] -= loss
+                    if unit == scout:
+                        utility += scout_bonus[nxt]
                 cleared |= bit
 
                 if npc_cnt[nxt] >= TRAMPLE_NPC:
@@ -937,7 +1397,8 @@ class Player:
                 taken = harvested.get(src, 0.0)
                 if taken:
                     left = self.est[src] - taken
-                    value = (left if left > 0.0 else 0.0) * self.gp[cell][src]
+                    value = ((left if left > 0.0 else 0.0) *
+                             self.priority_ratio[src] * self.gp[cell][src])
             future[unit], future_source[unit] = value, src
 
         if future_source[0] >= 0 and future_source[0] == future_source[1]:
@@ -946,6 +1407,8 @@ class Player:
             future_value = high + 0.35 * low
         else:
             future_value = future[0] + future[1]
+
+        utility += denial[positions[scout]]
 
         return (utility + pot_w * future_value, tuple(positions), harvested,
                 known_bombs, cleared)
