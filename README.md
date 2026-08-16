@@ -13,6 +13,87 @@
 - `benchmark_strategy.py` — 500 回合热路径延迟基准
 - `test_strategy.py` — 规则、输入兼容性与合法输出回归测试
 
+## v2.3：beam 换成精确 DFS + 分支限界（2026-08-16）
+
+`Strategy::plan` 里的 beam search 已被**深度 6 的精确 DFS + 分支限界**完全取代。
+分支因子 ≤ 4（`STAY` 由单调 carry-forward 处理，不进搜索），所以整棵树最多
+`(4^7-1)/3 = 5461` 个节点——**"好路线在 width 3 被剪掉"这个失效模式现在结构上
+不可能发生**。递归时每个深度直接写入对应的 `result[depth]` 槽位，
+`plan()` 本来就要返回的**每预算边际曲线因此是免费的**，不需要按预算各搜一次。
+
+可采纳的上界（`Strategy::dfs`）：
+
+```text
+bound = utility
+      + remaining_steps × reach_gain_[remaining][pos]     // 障碍感知的曼哈顿膨胀
+      + POT_W_eff × pot_[pos] × GAMMA^(-remaining)        // max-decay 变换的性质
+      + DENIAL_CAP                                        // 仅侦察角色
+```
+
+- `reach_gain_[k][c]` = 距 `c` 不超过 `k` 步（绕障碍）的格子里最大的单步拾取量，
+  每回合用 6 层单跳膨胀算一次，`6 × 289 × 4` 次比较。
+- 第二项的合法性来自 `pot_` 是**精确**的曼哈顿 max-decay 变换：
+  对任意距离 `k` 的 `c'` 有 `pot_[c'] ≤ pot_[c] × GAMMA^(-k)`。
+- 炸弹、踩踏、迷雾都是负项，忽略它们只会抬高上界，方向是安全的。
+
+剪枝条件是 `bound ≤ min(result[depth+1..budget].score)`——因为后代可能改进的是
+任意一个深度槽位，不能只跟最终预算比。
+
+### 验证（真实对局输入，见 `LOG_ANALYSIS_460712.md`）
+
+回放台用 `game_460712.log` 里我方 500 回合的真实 `GameInput` 驱动 `.so`：
+
+| | median | P90 | P99 | max | 占 300ms |
+|---|---:|---:|---:|---:|---:|
+| beam width 3（v2.2） | 15.1 us | 18.2 us | 31.6 us | 147 us | 0.006% |
+| **DFS + 分支限界（v2.3）** | **41.8 us** | **67.3 us** | **97.5 us** | **339 us** | **0.022%** |
+| 仓库合成负载 `sotest` | 101 us | 133 us | 156 us | — | 0.044% |
+
+**三项等价性证明（checksum 逐位相同）：**
+
+1. **剪枝无损**：开/关分支限界，checksum 都是 `381506086`，即上界确实可采纳，
+   B&B 与完全枚举给出同一组决策，速度约 2x（无剪枝 median 85 us）。
+2. **回溯正确**：把原地 undo 换成"整体快照 + 赋值还原"的朴素实现，checksum 不变。
+   实测朴素快照**更快**（`SearchState` 约 170 字节 POD，向量化拷贝比分支式
+   逐字段 undo 便宜），故最终采用快照版。
+3. **ASan / UBSan**：500 回合零报错，checksum 不变。
+
+严格编译零 warning：
+
+```bash
+g++ -std=c++17 -O2 -fPIC -Wall -Wextra -Warray-bounds=2 -Wstringop-overflow=4 \
+    -shared -o player.so strategy.cpp     # 0 error 0 warning
+g++ -std=c++17 -O3 -march=native -fPIC -Wall -Wextra -shared -o /dev/null strategy.cpp
+```
+
+### 收益：真实但很小，**不要高估**
+
+联合决策得分逐回合对比（同一批输入）：
+
+```text
+DFS 严格更优 163 回合 / 更差 4 回合 / 持平 333 回合
+500 轮总得分增益 +178.8（均值 +0.358/轮）
+```
+
+得分含 `POT_W` 势场项，折算成真实金币大约 **+3~4%**。这和另一条独立测算吻合：
+用当时可见信息做精确 DFS 求上限，**beam 全局只漏了 83 金币（捕获率 96.7%）**。
+
+**因此 README 五附 A 的判断需要修正**：`BEAM_WIDTH=3` 剪掉好路线在理论上成立，
+但在真实对局里几乎没有发生。换 DFS 是一次干净的"消除失效模式"，不是提分手段。
+真正的瓶颈见 `LOG_ANALYSIS_460712.md`：**信息（21.8% 的回合视野内一枚金币都没有、
+视野购买 500 轮零触发）和跨回合路由（中心重访间隔 P90 = 148 轮、
+一个角色在 `(2,16)` 蹲了 66 轮）**，不是回合内的搜索。
+
+移除的符号：`BEAM_WIDTH`、`MAX_BEAM_WIDTH`、`MAX_CANDIDATES`、`BeamState`、
+`better_beam`；`plan()` 去掉了 `beam_width` 参数。
+新增：`reach_bounds()`、`dfs()`、`SearchState`、`reach_gain_`、`inv_gamma_`、
+`pow5_`、`scout_max_`、`Mask289::reset`。
+
+> 注意 `pow5_[depth] - 1` 是"连续 depth 个 STAY"的动作编码。`result[depth].code`
+> 必须初始化成它——否则被完全堵死时会留下全 0 编码，解码成**六个向上移动**。
+
+---
+
 ## 当前实现：低延迟 v2.2 + Reset-Process Index（2026-08-14）
 
 本轮修改以“先于 NPC 执行”为第一目标，同时把首日总结中已经有强证据的
@@ -481,6 +562,12 @@ CONFIG 块有 ~15 个可调项，逐个手扫会陷入局部最优且漏掉交�
 
 **结论：诊断正确，方案方向可行，但提议的实现方式在本仓库当前代码上是不安全的，
 且它的时延论证已经过时。建议先做两个更便宜的实验，再决定是否落地。**
+
+> **2026-08-16 后记**：本节 A 的推导（好路线在 width 3 被剪掉）在理论上正确，
+> 但用 `game_460712.log` 实测后发现**在真实对局里几乎不发生**——beam 全局只漏了
+> 83 金币，捕获率 96.7%。D 节建议的"实验 1：宽度 3→8"已被更彻底的做法取代：
+> 直接换成精确 DFS（见本文件顶部 v2.3 一节），失效模式被结构性消除，
+> 但提分只有 +3~4%。**这一整节的优先级应下调。**
 
 ### A. 它诊断的偏差是真实的，可以量化
 
