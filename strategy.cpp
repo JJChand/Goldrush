@@ -22,8 +22,6 @@ constexpr int API_NPC_SLOTS = static_cast<int>(
 constexpr int NPC_CAP = 16;
 constexpr int MASK_WORDS = 5;
 constexpr int MAX_HARVEST = 12;
-constexpr int MAX_BEAM_WIDTH = 8;
-constexpr int MAX_CANDIDATES = MAX_BEAM_WIDTH * 4;
 
 constexpr float PICK_RATE = 0.65F;
 constexpr float BOMB_PCT = 0.10F;
@@ -39,7 +37,6 @@ constexpr int CENTER_HI = 12;
 constexpr int DR[5] = {-1, 1, 0, 0, 0};
 constexpr int DC[5] = {0, 0, -1, 1, 0};
 
-constexpr int BEAM_WIDTH = 3;
 constexpr float GAMMA = 0.72F;
 constexpr float POT_W = 0.35F;
 constexpr float DECAY = 0.95F;
@@ -158,6 +155,7 @@ struct Mask289 {
 
     void clear() noexcept { std::memset(word, 0, sizeof(word)); }
     void set(int cell) noexcept { word[cell >> 6] |= uint64_t{1} << (cell & 63); }
+    void reset(int cell) noexcept { word[cell >> 6] &= ~(uint64_t{1} << (cell & 63)); }
     bool test(int cell) const noexcept {
         return (word[cell >> 6] >> (cell & 63)) & uint64_t{1};
     }
@@ -200,6 +198,7 @@ struct HarvestState {
             mask.set(target);
         }
     }
+
 };
 
 struct PlanResult {
@@ -211,16 +210,18 @@ struct PlanResult {
     Mask289 cleared{};
 };
 
-struct BeamState {
-    float score = 0.0F;
-    uint32_t uid = 0;
+// Single mutable node of the exact depth-first search.  One instance is reused
+// for the whole walk: a child snapshots it, applies its delta, recurses, then
+// restores the snapshot.  The struct is ~170 bytes of trivially copyable POD, so
+// save/restore compiles to a handful of vector moves — measurably cheaper than
+// the branchy per-field undo bookkeeping it replaced.
+struct SearchState {
+    int pos = 0;
     float utility = 0.0F;
     float wealth = 0.0F;
-    int pos = 0;
+    uint32_t code = 0;
     HarvestState harvest{};
     Mask289 cleared{};
-    uint32_t code = 0;
-    bool blind = false;
 };
 
 struct JointResult {
@@ -258,6 +259,8 @@ public:
 private:
     uint8_t dist_[NN][NN]{};
     float gp_[NN][NN]{};
+    float inv_gamma_[STEPS + 1]{};
+    uint32_t pow5_[STEPS + 1]{};
     float decay_pow_[501]{};
     uint8_t index_raw_[18][31]{};
     float priority_lookup_[18][INDEX_QUARTERS]{};
@@ -299,11 +302,27 @@ private:
     int turn_scout_ = 0;
     int turn_collector_ = 1;
     float scout_bonus_[NN]{};
+    float scout_max_ = 0.0F;
     float denial_[NN]{};
     float turn_risk_rate_[6]{};
     float turn_fog_penalty_ = 0.0F;
     int round_ = 0;
     int last_round_ = -1;
+
+    // reach_gain_[k][c] = the largest single-step pickup available on any cell
+    // within k obstacle-aware steps of c.  Recomputed once per turn and used as
+    // the admissible part of the branch-and-bound bound.
+    float reach_gain_[STEPS + 1][NN]{};
+
+    SearchState search_{};
+    const Mask289* search_blocked_ = nullptr;
+    const int* search_npc_ = nullptr;
+    PlanResult* search_result_ = nullptr;
+    float search_pot_weight_ = 0.0F;
+    int search_unit_gold_ = 0;
+    int search_budget_ = 0;
+    int search_cycle_start_ = 0;
+    bool search_scout_ = false;
 
     void initialize_static_tables() noexcept;
     void reset_game() noexcept;
@@ -313,12 +332,14 @@ private:
     void index_priority(int round, const int* npcs, int npc_count,
                         const int* enemies, int enemy_count) noexcept;
     void potential() noexcept;
+    void reach_bounds() noexcept;
     void classify_roles(int round, const int gold[2], const int position[2],
                         const int* enemies, int enemy_count) noexcept;
+    void dfs(int depth) noexcept;
     void plan(int start, int unit_gold, int budget, const Mask289& blocked,
               const int npc_count[NN], float pot_weight, int unit_id,
               const HarvestState* pre_harvest, const Mask289& initial_cleared,
-              int beam_width, PlanResult result[STEPS + 1]) noexcept;
+              PlanResult result[STEPS + 1]) noexcept;
     JointResult joint_score(const int starts[2], const int gold[2],
                             const int actions[2][STEPS], const int length[2], int order,
                             const Mask289& enemy_mask,
@@ -328,9 +349,6 @@ private:
 
     static int next_cell(int cell, int action) noexcept;
     static void decode_actions(uint32_t code, int depth, int* output) noexcept;
-    static bool better_beam(const BeamState& a, const BeamState& b) noexcept {
-        return a.score > b.score || (a.score == b.score && a.uid > b.uid);
-    }
 };
 
 static_assert(std::is_standard_layout<GameInput>::value,
@@ -351,6 +369,17 @@ void Strategy::initialize_static_tables() noexcept {
     }
     decay_pow_[0] = 1.0F;
     for (int i = 1; i <= 500; ++i) decay_pow_[i] = decay_pow_[i - 1] * DECAY;
+
+    // pot_ is an exact Manhattan max-decay transform, so for any cell c' at
+    // distance k from c we have pot_[c'] <= pot_[c] * GAMMA^-k.  inv_gamma_ is
+    // that admissible inflation factor; pow5_[d] - 1 is the action code that
+    // decodes to d consecutive STAYs.
+    inv_gamma_[0] = 1.0F;
+    pow5_[0] = 1U;
+    for (int i = 1; i <= STEPS; ++i) {
+        inv_gamma_[i] = inv_gamma_[i - 1] / GAMMA;
+        pow5_[i] = pow5_[i - 1] * 5U;
+    }
 
     for (int table = 0; table < 18; ++table) {
         for (int i = 0; i < 31; ++i) {
@@ -718,6 +747,39 @@ void Strategy::potential() noexcept {
     }
 }
 
+void Strategy::reach_bounds() noexcept {
+    for (int cell = 0; cell < NN; ++cell) {
+        float gain = 0.0F;
+        const float available = est_[cell];
+        if (available > 1e-9F && !obstacle_[cell]) {
+            if (last_seen_[cell] == round_) gain = std::ceil(PICK_RATE * available);
+            else if (available < 1.0F) gain = available;
+            else gain = std::min(available, PICK_RATE * available + 0.35F);
+        }
+        reach_gain_[0][cell] = gain;
+    }
+    // Obstacle-aware Manhattan dilation: one hop per level, 4 lookups per cell.
+    // Only walkable neighbours propagate, which keeps the bound tight without
+    // ever making it inadmissible (unknown cells default to walkable).
+    for (int k = 1; k <= STEPS; ++k) {
+        const float* previous = reach_gain_[k - 1];
+        float* current = reach_gain_[k];
+        for (int cell = 0; cell < NN; ++cell) {
+            float best = previous[cell];
+            const int row = row_of(cell), col = col_of(cell);
+            if (row > 0 && !obstacle_[cell - N])
+                best = std::max(best, previous[cell - N]);
+            if (row < N - 1 && !obstacle_[cell + N])
+                best = std::max(best, previous[cell + N]);
+            if (col > 0 && !obstacle_[cell - 1])
+                best = std::max(best, previous[cell - 1]);
+            if (col < N - 1 && !obstacle_[cell + 1])
+                best = std::max(best, previous[cell + 1]);
+            current[cell] = best;
+        }
+    }
+}
+
 void Strategy::classify_roles(int round, const int gold[2], const int position[2],
                               const int* enemies, int enemy_count) noexcept {
     const int cycle = round / 20;
@@ -757,6 +819,7 @@ void Strategy::classify_roles(int round, const int gold[2], const int position[2
         info_strength *= std::max(0.0F, static_cast<float>(future) / ENDGAME_ROUNDS);
     const float clear_strength = phase < SCOUT_BOMB_ROUNDS ? 1.0F : 0.0F;
     std::memset(scout_bonus_, 0, sizeof(scout_bonus_));
+    scout_max_ = 0.0F;
 
     const int cycle_start = round - phase;
     const int scout_loss = gold[scout] > 0 ?
@@ -781,6 +844,7 @@ void Strategy::classify_roles(int round, const int gold[2], const int position[2
                 }
             }
             scout_bonus_[cell] = bonus;
+            scout_max_ = std::max(scout_max_, bonus);
         }
     }
 
@@ -818,10 +882,125 @@ void Strategy::classify_roles(int round, const int gold[2], const int position[2
     }
 }
 
+// Exact depth-first walk enumeration with branch-and-bound.  Branching is at
+// most 4 (STAY is handled by the monotone carry-forward below, never as a search
+// action) and depth is at most STEPS, so the whole tree is <= (4^7-1)/3 = 5461
+// nodes even with pruning disabled.  Every node writes into the per-depth result
+// slot, which is what makes the marginal curve `plan()` returns fall out of the
+// recursion for free instead of needing one search per budget.
+void Strategy::dfs(int depth) noexcept {
+    const int remaining = search_budget_ - depth;
+    if (remaining <= 0) return;
+
+    // Admissible bound on the score of every descendant of this node:
+    //   utility now
+    // + remaining_steps * best single-step gain anywhere still in reach
+    // + pot_weight * the largest terminal potential still in reach
+    // + the denial cap (only the scout can ever collect it).
+    // Bomb, trample and fog terms are strictly negative, so dropping them can
+    // only inflate the bound, which is the safe direction.
+    float bound = search_.utility +
+                  static_cast<float>(remaining) *
+                      (reach_gain_[remaining][search_.pos] +
+                       (search_scout_ ? scout_max_ : 0.0F)) +
+                  search_pot_weight_ * pot_[search_.pos] * inv_gamma_[remaining];
+    if (search_scout_) bound += DENIAL_CAP;
+
+    // Descendants live at depths depth+1..budget, so this node is only worth
+    // expanding if the bound beats the weakest slot it could still improve.
+    float tail_best = search_result_[depth + 1].score;
+    for (int d = depth + 2; d <= search_budget_; ++d)
+        tail_best = std::min(tail_best, search_result_[d].score);
+    if (bound <= tail_best) return;
+
+    const SearchState snapshot = search_;
+    const int base_pos = snapshot.pos;
+    const float base_utility = snapshot.utility;
+    const float base_wealth = snapshot.wealth;
+    const uint32_t base_code = snapshot.code;
+    const float held = search_unit_gold_ + base_wealth;
+    const float bomb_penalty = held > 0.0F ? std::ceil(BOMB_PCT * held) : 0.0F;
+
+    // Children are expanded in plain action order.  A move-ordering pass keyed
+    // on reach_gain_/pot_ was measured and is a net loss here: at depth 6 with
+    // branching 4 the key computation costs more than the extra pruning saves.
+    for (int action = 0; action < 4; ++action) {
+        const int next = next_cell(base_pos, action);
+        if (next < 0 || obstacle_[next] || search_blocked_->test(next)) continue;
+
+        const float taken = search_.harvest.get(next);
+        const float available = est_[next] - taken;
+        float pickup = 0.0F;
+        if (available > 1e-9F) {
+            if (last_seen_[next] == round_) pickup = std::ceil(PICK_RATE * available);
+            else if (available < 1.0F) pickup = available;
+            else pickup = std::min(available, PICK_RATE * available + 0.35F);
+            search_.harvest.add(next, pickup);
+        }
+        float utility = base_utility + pickup;
+        float wealth = base_wealth + pickup;
+
+        const bool first_visit = !search_.cleared.test(next);
+        if (first_visit) {
+            search_.cleared.set(next);
+            float loss = 0.0F;
+            if (bomb_[next]) loss = bomb_penalty;
+            else if (bomb_safe_round_[next] < search_cycle_start_ && bomb_penalty > 0.0F)
+                loss = turn_risk_rate_[region_[next]] * bomb_penalty;
+            utility -= loss;
+            wealth -= loss;
+            if (search_scout_) utility += scout_bonus_[next];
+        }
+        if (search_npc_[next] >= TRAMPLE_NPC) {
+            const float after = search_unit_gold_ + wealth;
+            const float loss = after > 0.0F ? std::ceil(TRAMPLE_PCT * after) : 0.0F;
+            utility -= loss;
+            wealth -= loss;
+        }
+        const bool blind = !terrain_known_[next];
+        if (blind) utility -= turn_fog_penalty_;
+
+        search_.pos = next;
+        search_.utility = utility;
+        search_.wealth = wealth;
+        search_.code = base_code * 5U + static_cast<uint32_t>(action);
+
+        float terminal = pot_[next];
+        const int terminal_source = pot_source_[next];
+        if (terminal_source >= 0) {
+            const float source_taken = search_.harvest.get(terminal_source);
+            if (source_taken > 0.0F) {
+                const float left = std::max(0.0F, est_[terminal_source] - source_taken);
+                terminal = left * priority_ratio_[terminal_source] *
+                           gp_[next][terminal_source];
+            }
+        }
+        float score = utility + search_pot_weight_ * terminal;
+        if (search_scout_) score += denial_[next];
+
+        PlanResult& slot = search_result_[depth + 1];
+        if (score > slot.score) {
+            slot.score = score;
+            slot.wealth = wealth;
+            slot.code = search_.code;
+            slot.harvest = search_.harvest;
+            slot.final_cell = next;
+            slot.cleared = search_.cleared;
+        }
+
+        // Stepping into unknown terrain ends the walk exactly as the beam did:
+        // the belief past that cell is worthless, so we score it but do not
+        // pretend to plan through it.
+        if (!blind) dfs(depth + 1);
+
+        search_ = snapshot;
+    }
+}
+
 void Strategy::plan(int start, int unit_gold, int budget, const Mask289& blocked,
                     const int npc_count[NN], float pot_weight, int unit_id,
                     const HarvestState* pre_harvest,
-                    const Mask289& initial_cleared, int beam_width,
+                    const Mask289& initial_cleared,
                     PlanResult result[STEPS + 1]) noexcept {
     const bool is_scout = unit_id == turn_scout_;
     HarvestState initial_harvest{};
@@ -843,138 +1022,35 @@ void Strategy::plan(int start, int unit_gold, int budget, const Mask289& blocked
         result[depth].harvest = initial_harvest;
         result[depth].final_cell = start;
         result[depth].cleared = initial_cleared;
+        // Default to standing still for this budget.  If the DFS never improves
+        // this slot (fully boxed in, or every walk scores below staying put) the
+        // decoded plan must be STAYs, not the all-zero code, which would decode
+        // to six UP moves.
+        result[depth].code = pow5_[depth] - 1U;
     }
+    if (budget <= 0) return;
 
-    BeamState beam[MAX_BEAM_WIDTH]{};
-    int beam_count = 1;
-    beam[0].score = base;
-    beam[0].uid = 0;
-    beam[0].pos = start;
-    beam[0].harvest = initial_harvest;
-    beam[0].cleared = initial_cleared;
-    uint32_t next_uid = 1;
-    const int cycle_start = round_ - round_ % 20;
+    search_blocked_ = &blocked;
+    search_npc_ = npc_count;
+    search_result_ = result;
+    search_pot_weight_ = pot_weight;
+    search_unit_gold_ = unit_gold;
+    search_budget_ = budget;
+    search_cycle_start_ = round_ - round_ % 20;
+    search_scout_ = is_scout;
+    search_.pos = start;
+    search_.utility = 0.0F;
+    search_.wealth = 0.0F;
+    search_.code = 0;
+    search_.harvest = initial_harvest;
+    search_.cleared = initial_cleared;
 
+    dfs(0);
+
+    // Spending fewer steps is always allowed, so the curve must be monotone:
+    // a longer budget inherits the shorter plan padded with STAYs whenever the
+    // extra steps cannot pay for themselves.
     for (int depth = 1; depth <= budget; ++depth) {
-        BeamState candidate[MAX_CANDIDATES]{};
-        int candidate_count = 0;
-        for (int b = 0; b < beam_count; ++b) {
-            const BeamState& state = beam[b];
-            if (state.blind) continue;
-            const float held = unit_gold + state.wealth;
-            const float bomb_penalty = held > 0.0F ? std::ceil(BOMB_PCT * held) : 0.0F;
-            for (int action = 0; action < 4; ++action) {
-                const int next = next_cell(state.pos, action);
-                if (next < 0 || obstacle_[next] || blocked.test(next)) continue;
-
-                BeamState updated = state;
-                updated.pos = next;
-                updated.uid = next_uid;
-                updated.code = state.code * 5U + static_cast<uint32_t>(action);
-                const float taken = state.harvest.get(next);
-                const float available = est_[next] - taken;
-                float pickup = 0.0F;
-                if (available > 1e-9F) {
-                    if (last_seen_[next] == round_) pickup = std::ceil(PICK_RATE * available);
-                    else if (available < 1.0F) pickup = available;
-                    else pickup = std::min(available, PICK_RATE * available + 0.35F);
-                    updated.harvest.add(next, pickup);
-                }
-                updated.utility += pickup;
-                updated.wealth += pickup;
-
-                const bool first_visit = !state.cleared.test(next);
-                updated.cleared.set(next);
-                if (first_visit) {
-                    float loss = 0.0F;
-                    if (bomb_[next]) loss = bomb_penalty;
-                    else if (bomb_safe_round_[next] < cycle_start && bomb_penalty > 0.0F)
-                        loss = turn_risk_rate_[region_[next]] * bomb_penalty;
-                    updated.utility -= loss;
-                    updated.wealth -= loss;
-                    if (is_scout) updated.utility += scout_bonus_[next];
-                }
-                if (npc_count[next] >= TRAMPLE_NPC) {
-                    const float after = unit_gold + updated.wealth;
-                    const float loss = after > 0.0F ? std::ceil(TRAMPLE_PCT * after) : 0.0F;
-                    updated.utility -= loss;
-                    updated.wealth -= loss;
-                }
-                updated.blind = !terrain_known_[next];
-                if (updated.blind) updated.utility -= turn_fog_penalty_;
-
-                float terminal = pot_[next];
-                const int terminal_source = pot_source_[next];
-                if (terminal_source >= 0) {
-                    const float source_taken = updated.harvest.get(terminal_source);
-                    if (source_taken > 0.0F) {
-                        const float left = std::max(0.0F,
-                            est_[terminal_source] - source_taken);
-                        terminal = left * priority_ratio_[terminal_source] *
-                                   gp_[next][terminal_source];
-                    }
-                }
-                updated.score = updated.utility + pot_weight * terminal;
-                if (is_scout) updated.score += denial_[next];
-
-                int duplicate = -1;
-                for (int i = 0; i < candidate_count; ++i) {
-                    if (candidate[i].pos == updated.pos &&
-                        candidate[i].harvest.mask == updated.harvest.mask &&
-                        candidate[i].cleared == updated.cleared) {
-                        duplicate = i;
-                        break;
-                    }
-                }
-                if (duplicate < 0) {
-                    if (candidate_count < MAX_CANDIDATES)
-                        candidate[candidate_count++] = updated;
-                    ++next_uid;
-                } else if (updated.score > candidate[duplicate].score) {
-                    candidate[duplicate] = updated;
-                    ++next_uid;
-                }
-            }
-        }
-
-        if (candidate_count == 0) {
-            for (int rest = depth; rest <= budget; ++rest) {
-                result[rest] = result[rest - 1];
-                result[rest].code = result[rest - 1].code * 5U + STAY;
-            }
-            break;
-        }
-
-        std::sort(candidate, candidate + candidate_count, better_beam);
-        beam_count = 0;
-        if (beam_width <= 4 && candidate_count > beam_width) {
-            bool endpoint_used[NN]{};
-            for (int i = 0; i < candidate_count && beam_count < beam_width; ++i) {
-                if (!endpoint_used[candidate[i].pos]) {
-                    beam[beam_count++] = candidate[i];
-                    endpoint_used[candidate[i].pos] = true;
-                }
-            }
-            if (beam_count < beam_width) {
-                for (int i = 0; i < candidate_count && beam_count < beam_width; ++i) {
-                    bool selected = false;
-                    for (int j = 0; j < beam_count; ++j)
-                        if (beam[j].uid == candidate[i].uid) selected = true;
-                    if (!selected) beam[beam_count++] = candidate[i];
-                }
-            }
-        } else {
-            beam_count = std::min({beam_width, candidate_count, MAX_BEAM_WIDTH});
-            for (int i = 0; i < beam_count; ++i) beam[i] = candidate[i];
-        }
-
-        const BeamState& best = beam[0];
-        result[depth].score = best.score;
-        result[depth].wealth = best.wealth;
-        result[depth].code = best.code;
-        result[depth].harvest = best.harvest;
-        result[depth].final_cell = best.pos;
-        result[depth].cleared = best.cleared;
         if (result[depth - 1].score > result[depth].score) {
             result[depth] = result[depth - 1];
             result[depth].code = result[depth - 1].code * 5U + STAY;
@@ -1152,6 +1228,7 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
     estimate(input, round);
     index_priority(round, npcs, npc_total, enemies, enemy_total);
     potential();
+    reach_bounds();
 
     Mask289 enemy_mask{};
     for (int i = 0; i < enemy_total; ++i) enemy_mask.set(enemies[i]);
@@ -1175,9 +1252,9 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
     const Mask289 empty_mask{};
     PlanResult curve[2][STEPS + 1];
     plan(position[0], gold[0], STEPS, enemy_mask, npc_count, pot_weight, 0,
-         nullptr, empty_mask, BEAM_WIDTH, curve[0]);
+         nullptr, empty_mask, curve[0]);
     plan(position[1], gold[1], STEPS, enemy_mask, npc_count, pot_weight, 1,
-         nullptr, empty_mask, BEAM_WIDTH, curve[1]);
+         nullptr, empty_mask, curve[1]);
 
     int path[2][STEPS + 1][STEPS]{};
     for (int depth = 0; depth <= STEPS; ++depth) {
@@ -1254,7 +1331,7 @@ GameOutput Strategy::decide(const GameInput& input) noexcept {
             PlanResult tail[STEPS + 1];
             plan(position[second], gold[second], budget[second], blocked,
                  npc_count, pot_weight, second, &lead.harvest, lead.cleared,
-                 std::max(6, BEAM_WIDTH), tail);
+                 tail);
             decode_actions(tail[budget[second]].code, budget[second],
                            coordinated[second]);
             const JointResult result = joint_score(position, gold, coordinated,
